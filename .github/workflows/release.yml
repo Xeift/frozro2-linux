@@ -47,11 +47,13 @@ jobs:
           set -e
           VERSION="${GITHUB_REF_NAME#v}"
           DEB="dist/frozro2-linux_${VERSION}_all.deb"
+          LATEST_DEB="dist/frozro2-linux_latest_all.deb"
+          cp "$DEB" "$LATEST_DEB"
 
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "$DEB" --clobber
+            gh release upload "$GITHUB_REF_NAME" "$DEB" "$LATEST_DEB" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "$DEB" \
+            gh release create "$GITHUB_REF_NAME" "$DEB" "$LATEST_DEB" \
               --title "Frozr-O II Linux $GITHUB_REF_NAME" \
               --generate-notes
           fi

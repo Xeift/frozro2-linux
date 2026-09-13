@@ -4,10 +4,11 @@ Unofficial Linux controller for the XIGMATEK Frozr-O II LCD.
 
 ## Install
 
-Download the latest `.deb` from GitHub Releases:
+Download and install the latest `.deb`:
 
 ```bash
-sudo apt install ./frozro2-linux_*_all.deb
+wget https://github.com/Xeift/frozro2-linux/releases/latest/download/frozro2-linux_latest_all.deb
+sudo apt install ./frozro2-linux_latest_all.deb
 ```
 
 Then launch **Frozr-O II Linux** from the app menu.
