@@ -2,6 +2,8 @@
 
 Unofficial Linux controller for the XIGMATEK Frozr-O II LCD.
 
+![Frozr-O II Linux demo](demo.gif)
+
 ## Install
 
 Download and install the latest `.deb`:
