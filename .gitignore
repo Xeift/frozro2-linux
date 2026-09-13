@@ -1,0 +1,15 @@
+.build/
+dist/
+tests/home*/
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+coverage/
+
+*.log
+.DS_Store
+*~
+*.swp

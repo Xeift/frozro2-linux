@@ -1,0 +1,4 @@
+# XIGMATEK Frozr-O II / Turing CT21INCH serial identities.
+# TAG+=uaccess grants the active desktop user access; dialout is the fallback.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0121", MODE="0660", GROUP="dialout", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="ca21", MODE="0660", GROUP="dialout", TAG+="uaccess"

@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore Frozr LCD content
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 2
+ExecStart=@CLI@ restore
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Frozr-O II Linux
+Comment=Control the XIGMATEK Frozr-O II LCD on Linux
+Exec=@GUI@
+Icon=video-display
+Terminal=false
+Categories=Settings;HardwareSettings;
+StartupNotify=true

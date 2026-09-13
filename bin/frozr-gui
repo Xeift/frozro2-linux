@@ -1,0 +1,1637 @@
+#!/usr/bin/gjs
+'use strict';
+
+imports.gi.versions.Gtk = '4.0';
+imports.gi.versions.Gdk = '4.0';
+imports.gi.versions.Adw = '1';
+
+const Gio = imports.gi.Gio;
+const GLib = imports.gi.GLib;
+const Gtk = imports.gi.Gtk;
+const Gdk = imports.gi.Gdk;
+const Adw = imports.gi.Adw;
+const Cairo = imports.cairo;
+const System = imports.system;
+
+const ROOTS = [
+    '/mnt/SDCARD/video/',
+    '/mnt/SDCARD/img/',
+    '/root/video/',
+    '/root/img/',
+];
+
+function pathExists(path) {
+    return GLib.file_test(path, GLib.FileTest.EXISTS);
+}
+
+function drawRoundMask(_area, cr, width, height) {
+    const size = Math.min(width, height);
+    const cx = width / 2;
+    const cy = height / 2;
+    const radius = Math.max(1, size / 2 - 5);
+
+    cr.setFillRule(Cairo.FillRule.EVEN_ODD);
+    cr.rectangle(0, 0, width, height);
+    cr.arc(cx, cy, radius, 0, Math.PI * 2);
+    cr.setSourceRGBA(0.025, 0.025, 0.03, 1);
+    cr.fill();
+
+    cr.setFillRule(Cairo.FillRule.WINDING);
+    cr.arc(cx, cy, radius, 0, Math.PI * 2);
+    cr.setLineWidth(7);
+    cr.setSourceRGBA(0.12, 0.13, 0.15, 1);
+    cr.stroke();
+    cr.arc(cx, cy, radius - 4, 0, Math.PI * 2);
+    cr.setLineWidth(1.5);
+    cr.setSourceRGBA(0.42, 0.45, 0.48, 0.8);
+    cr.stroke();
+}
+
+function resolveCli() {
+    const invoked = System.programInvocationName;
+    const absolute = GLib.path_is_absolute(invoked)
+        ? invoked
+        : GLib.canonicalize_filename(invoked, GLib.get_current_dir());
+    const sibling = GLib.build_filenamev([GLib.path_get_dirname(absolute), 'frozrctl']);
+    if (pathExists(sibling))
+        return sibling;
+    const fromPath = GLib.find_program_in_path('frozrctl');
+    if (fromPath)
+        return fromPath;
+    throw new Error('frozrctl was not found next to the GUI or in PATH');
+}
+
+if (ARGV.includes('--help')) {
+    print('Usage: frozr-gui\n\nGTK4/Libadwaita frontend for frozrctl.');
+    System.exit(0);
+}
+
+let gtkReady = false;
+try {
+    gtkReady = Gtk.init_check();
+} catch (error) {
+    printerr(`frozr-gui: GTK initialization failed: ${error.message}`);
+    System.exit(1);
+}
+if (!gtkReady) {
+    printerr('frozr-gui: unable to open the graphical display. Run it from your logged-in desktop session (without sudo).');
+    System.exit(1);
+}
+
+const CLI = resolveCli();
+
+class FrozrWindow {
+    constructor(app) {
+        this.app = app;
+        this.window = new Adw.ApplicationWindow({
+            application: app,
+            title: 'Frozr-O II Linux',
+            default_width: 960,
+            default_height: 840,
+        });
+        this.busy = 0;
+        this.selectedFile = null;
+        this.selectedKind = null;
+        this.selectedCodec = null;
+        this.contentInfoProc = null;
+        this.startupSelectedFile = null;
+        this.startupSelectedKind = null;
+        this.startupSelectedCodec = null;
+        this.startupContentInfoProc = null;
+        this.startupPreviewProc = null;
+        this.startupFrameProc = null;
+        this.startupFrameTimerId = 0;
+        this.startupFrameDir = null;
+        this.startupPreviewFrames = [];
+        this.startupActivePreviewPath = null;
+        this.startupPreviewGeneration = 0;
+        this.lastAction = null;
+        this.resumeDashboardAfterStartup = false;
+        this.dashboardProc = null;
+        this.previewProc = null;
+        this.previewFrameProc = null;
+        this.previewFrameTimerId = 0;
+        this.previewFrameDir = null;
+        this.previewFrames = [];
+        this.activePreviewPath = null;
+        this.previewGeneration = 0;
+        this.previewTempPaths = new Set();
+        this.transformSaveProc = null;
+        this.pendingTransformSave = null;
+        this.rotation = 0;
+        this.mirrorHorizontalValue = false;
+        this.mirrorVerticalValue = false;
+        this.startupRotation = 0;
+        this.startupMirrorHorizontalValue = false;
+        this.startupMirrorVerticalValue = false;
+        this.buildUi();
+        this.refreshStatus(true);
+        this.loadConfig();
+    }
+
+    buildUi() {
+        const root = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL});
+        const header = new Adw.HeaderBar();
+        header.set_title_widget(new Adw.WindowTitle({title: 'Frozr-O II Linux', subtitle: 'XIGMATEK Frozr-O II LCD controller'}));
+        root.append(header);
+
+        const scroller = new Gtk.ScrolledWindow({hexpand: true, vexpand: true});
+        const content = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 18,
+            margin_top: 18,
+            margin_bottom: 18,
+            margin_start: 18,
+            margin_end: 18,
+        });
+        scroller.set_child(content);
+        root.append(scroller);
+
+        content.append(this.buildDeviceSection());
+        content.append(this.buildDisplaySection());
+        content.append(this.buildStorageSection());
+        content.append(this.buildLogSection());
+
+        this.window.set_content(root);
+    }
+
+    makeSection(title) {
+        const outer = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 8});
+        const label = new Gtk.Label({label: title, xalign: 0});
+        label.add_css_class('title-4');
+        outer.append(label);
+        const frame = new Gtk.Frame();
+        const body = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 10,
+            margin_top: 12,
+            margin_bottom: 12,
+            margin_start: 12,
+            margin_end: 12,
+        });
+        frame.set_child(body);
+        outer.append(frame);
+        return {outer, body};
+    }
+
+    makeButton(label, callback) {
+        const button = new Gtk.Button({label});
+        button.connect('clicked', callback);
+        return button;
+    }
+
+    makeToolButton(label, tooltip, callback, toggle = false) {
+        const button = toggle ? new Gtk.ToggleButton({label}) : new Gtk.Button({label});
+        button.set_tooltip_text(tooltip);
+        button.add_css_class('pill');
+        if (toggle)
+            button.connect('toggled', callback);
+        else
+            button.connect('clicked', callback);
+        return button;
+    }
+
+    buildDeviceSection() {
+        const {outer, body} = this.makeSection('Device');
+        const row = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        this.statusLabel = new Gtk.Label({label: 'Checking…', xalign: 0, hexpand: true, wrap: true});
+        row.append(this.statusLabel);
+        row.append(this.makeButton('Refresh', () => this.refreshStatus()));
+        body.append(row);
+        return outer;
+    }
+
+    buildDisplaySection() {
+        const outer = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 10});
+        const displayTitle = new Gtk.Label({label: 'Display', xalign: 0});
+        displayTitle.add_css_class('title-4');
+        outer.append(displayTitle);
+        const body = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 12});
+        outer.append(body);
+
+        const brightnessTitle = new Gtk.Label({label: 'Brightness', xalign: 0});
+        brightnessTitle.add_css_class('heading');
+        body.append(brightnessTitle);
+
+        const brightnessRow = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 10});
+        this.brightness = new Gtk.Scale({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            adjustment: new Gtk.Adjustment({lower: 0, upper: 100, step_increment: 1, page_increment: 10, value: 25}),
+            digits: 0,
+            draw_value: true,
+            hexpand: true,
+        });
+        brightnessRow.append(this.brightness);
+        const brightnessApply = this.makeButton('Apply', () => {
+            this.runCli(['brightness', String(Math.round(this.brightness.get_value()))]);
+        });
+        brightnessApply.set_valign(Gtk.Align.CENTER);
+        brightnessApply.set_hexpand(false);
+        brightnessRow.append(brightnessApply);
+        body.append(brightnessRow);
+        body.append(new Gtk.Separator({orientation: Gtk.Orientation.HORIZONTAL}));
+
+        const phases = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 14});
+        body.append(phases);
+
+        const startupBody = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 10,
+            margin_top: 4,
+            margin_bottom: 6,
+        });
+        phases.append(startupBody);
+
+        const startupHeader = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 10});
+        const startupTitle = new Gtk.Label({label: 'Before Linux starts', xalign: 0, hexpand: true});
+        startupTitle.add_css_class('heading');
+        startupHeader.append(startupTitle);
+        this.startupStatus = new Gtk.Label({label: 'Device default', xalign: 1});
+        this.startupStatus.add_css_class('dim-label');
+        startupHeader.append(this.startupStatus);
+        startupBody.append(startupHeader);
+
+        const startupHint = new Gtk.Label({
+            label: 'Displayed by the LCD firmware after power-on, before Linux takes control.',
+            xalign: 0,
+            wrap: true,
+        });
+        startupHint.add_css_class('dim-label');
+        startupBody.append(startupHint);
+
+        const startupEditor = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 18});
+        startupBody.append(startupEditor);
+
+        const startupPreviewColumn = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 8});
+        startupPreviewColumn.set_size_request(380, -1);
+        const startupOverlay = new Gtk.Overlay();
+        startupOverlay.set_size_request(360, 360);
+        this.startupPreviewStack = new Gtk.Stack({
+            transition_type: Gtk.StackTransitionType.CROSSFADE,
+            can_target: false,
+        });
+        const startupEmptyPreview = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 10,
+            halign: Gtk.Align.CENTER,
+            valign: Gtk.Align.CENTER,
+        });
+        const startupEmptyIcon = new Gtk.Image({icon_name: 'image-x-generic-symbolic', pixel_size: 64});
+        startupEmptyIcon.add_css_class('dim-label');
+        startupEmptyPreview.append(startupEmptyIcon);
+        const startupEmptyTitle = new Gtk.Label({label: 'Choose content'});
+        startupEmptyTitle.add_css_class('title-4');
+        startupEmptyPreview.append(startupEmptyTitle);
+        this.startupPreviewPicture = new Gtk.Picture({
+            content_fit: Gtk.ContentFit.CONTAIN,
+            can_shrink: true,
+            keep_aspect_ratio: true,
+            can_target: false,
+        });
+        this.startupPreviewStack.add_named(startupEmptyPreview, 'empty');
+        this.startupPreviewStack.add_named(this.startupPreviewPicture, 'picture');
+        this.startupPreviewStack.set_visible_child_name('empty');
+        startupOverlay.set_child(this.startupPreviewStack);
+        this.startupPreviewMask = new Gtk.DrawingArea({hexpand: true, vexpand: true, can_target: false});
+        this.startupPreviewMask.set_draw_func(drawRoundMask);
+        startupOverlay.add_overlay(this.startupPreviewMask);
+        this.startupPreviewSpinner = new Gtk.Spinner({
+            halign: Gtk.Align.CENTER,
+            valign: Gtk.Align.CENTER,
+            visible: false,
+        });
+        this.startupPreviewSpinner.set_size_request(44, 44);
+        startupOverlay.add_overlay(this.startupPreviewSpinner);
+        const startupPreviewClick = new Gtk.GestureClick();
+        startupPreviewClick.connect('released', () => this.chooseStartupFile());
+        startupOverlay.add_controller(startupPreviewClick);
+        startupPreviewColumn.append(startupOverlay);
+        startupEditor.append(startupPreviewColumn);
+
+        const startupControls = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 14, hexpand: true});
+        startupControls.set_valign(Gtk.Align.START);
+        startupEditor.append(startupControls);
+
+        const startupChooseButton = this.makeButton('Choose content…', () => this.chooseStartupFile());
+        startupChooseButton.add_css_class('pill');
+        startupControls.append(startupChooseButton);
+        this.startupFileLabel = new Gtk.Label({label: 'Nothing selected', xalign: 0, ellipsize: 3, wrap: true});
+        this.startupFileLabel.add_css_class('dim-label');
+        startupControls.append(this.startupFileLabel);
+
+        const startupOrientationHeader = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        const startupOrientationTitle = new Gtk.Label({label: 'Orientation', xalign: 0, hexpand: true});
+        startupOrientationTitle.add_css_class('heading');
+        startupOrientationHeader.append(startupOrientationTitle);
+        this.startupOrientationLabel = new Gtk.Label({label: '0°'});
+        this.startupOrientationLabel.add_css_class('dim-label');
+        startupOrientationHeader.append(this.startupOrientationLabel);
+        startupControls.append(startupOrientationHeader);
+
+        const startupRotateRow = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        startupRotateRow.append(this.makeToolButton('↶ 90°', 'Rotate startup content left 90°', () => this.rotateStartup(-90)));
+        startupRotateRow.append(this.makeToolButton('↷ 90°', 'Rotate startup content right 90°', () => this.rotateStartup(90)));
+        startupControls.append(startupRotateRow);
+
+        const startupMirrorRow = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        this.startupMirrorHorizontalButton = this.makeToolButton('↔ Left / Right', 'Mirror startup content left and right', () => {
+            if (this.loadingConfig)
+                return;
+            this.startupMirrorHorizontalValue = this.startupMirrorHorizontalButton.get_active();
+            this.refreshStartupPreview();
+        }, true);
+        startupMirrorRow.append(this.startupMirrorHorizontalButton);
+        this.startupMirrorVerticalButton = this.makeToolButton('↕ Top / Bottom', 'Mirror startup content top and bottom', () => {
+            if (this.loadingConfig)
+                return;
+            this.startupMirrorVerticalValue = this.startupMirrorVerticalButton.get_active();
+            this.refreshStartupPreview();
+        }, true);
+        startupMirrorRow.append(this.startupMirrorVerticalButton);
+        startupControls.append(startupMirrorRow);
+
+        const startupResetRow = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        const startupResetButton = this.makeButton('Reset orientation', () => this.resetStartupTransform());
+        startupResetButton.add_css_class('flat');
+        startupResetRow.append(startupResetButton);
+        startupControls.append(startupResetRow);
+
+        const startupActions = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        this.startupUseButton = this.makeButton('Set startup content', () => this.setSelectedAsStartupDisplay());
+        this.startupUseButton.set_sensitive(false);
+        this.startupUseButton.add_css_class('suggested-action');
+        this.startupUseButton.set_hexpand(true);
+        startupActions.append(this.startupUseButton);
+        startupActions.append(this.makeButton('Use device default', () => this.resetStartupDisplay()));
+        startupControls.append(startupActions);
+
+        phases.append(new Gtk.Separator({orientation: Gtk.Orientation.HORIZONTAL}));
+        const sessionBody = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 10,
+            margin_top: 6,
+            margin_bottom: 4,
+        });
+        phases.append(sessionBody);
+
+        const sessionHeader = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 10});
+        const sessionTitle = new Gtk.Label({label: 'After login', xalign: 0, hexpand: true});
+        sessionTitle.add_css_class('heading');
+        sessionHeader.append(sessionTitle);
+        this.afterLoginStatus = new Gtk.Label({label: 'Nothing saved', xalign: 1});
+        this.afterLoginStatus.add_css_class('dim-label');
+        sessionHeader.append(this.afterLoginStatus);
+        sessionBody.append(sessionHeader);
+
+        const sessionHint = new Gtk.Label({
+            label: 'Your normal Linux-controlled display. The last content shown here is restored automatically on the next login.',
+            xalign: 0,
+            wrap: true,
+        });
+        sessionHint.add_css_class('dim-label');
+        sessionBody.append(sessionHint);
+
+        const editor = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 18});
+        sessionBody.append(editor);
+
+        const previewColumn = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 8});
+        previewColumn.set_size_request(380, -1);
+        const overlay = new Gtk.Overlay();
+        overlay.set_size_request(360, 360);
+        this.previewStack = new Gtk.Stack({
+            transition_type: Gtk.StackTransitionType.CROSSFADE,
+            can_target: false,
+        });
+
+        const emptyPreview = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 10,
+            halign: Gtk.Align.CENTER,
+            valign: Gtk.Align.CENTER,
+        });
+        const emptyIcon = new Gtk.Image({icon_name: 'image-x-generic-symbolic', pixel_size: 64});
+        emptyIcon.add_css_class('dim-label');
+        emptyPreview.append(emptyIcon);
+        const emptyTitle = new Gtk.Label({label: 'Choose something to display'});
+        emptyTitle.add_css_class('title-4');
+        emptyPreview.append(emptyTitle);
+        this.previewPicture = new Gtk.Picture({
+            content_fit: Gtk.ContentFit.CONTAIN,
+            can_shrink: true,
+            keep_aspect_ratio: true,
+            can_target: false,
+        });
+        this.previewStack.add_named(emptyPreview, 'empty');
+        this.previewStack.add_named(this.previewPicture, 'picture');
+        this.previewStack.set_visible_child_name('empty');
+        overlay.set_child(this.previewStack);
+
+        this.previewMask = new Gtk.DrawingArea({hexpand: true, vexpand: true, can_target: false});
+        this.previewMask.set_draw_func(drawRoundMask);
+        overlay.add_overlay(this.previewMask);
+
+        this.previewSpinner = new Gtk.Spinner({
+            halign: Gtk.Align.CENTER,
+            valign: Gtk.Align.CENTER,
+            visible: false,
+        });
+        this.previewSpinner.set_size_request(44, 44);
+        overlay.add_overlay(this.previewSpinner);
+        const previewClick = new Gtk.GestureClick();
+        previewClick.connect('released', () => this.chooseFile('Select an image, GIF, or video'));
+        overlay.add_controller(previewClick);
+        previewColumn.append(overlay);
+        editor.append(previewColumn);
+
+        const controls = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 14, hexpand: true});
+        controls.set_valign(Gtk.Align.START);
+        editor.append(controls);
+
+        const chooseButton = this.makeButton('Choose content…', () => this.chooseFile('Select an image, GIF, or video'));
+        chooseButton.add_css_class('pill');
+        controls.append(chooseButton);
+        this.fileLabel = new Gtk.Label({label: 'Nothing selected', xalign: 0, ellipsize: 3, wrap: true});
+        this.fileLabel.add_css_class('dim-label');
+        controls.append(this.fileLabel);
+
+        const orientationHeader = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        const orientationTitle = new Gtk.Label({label: 'Orientation', xalign: 0, hexpand: true});
+        orientationTitle.add_css_class('heading');
+        orientationHeader.append(orientationTitle);
+        this.orientationLabel = new Gtk.Label({label: '0°'});
+        this.orientationLabel.add_css_class('dim-label');
+        orientationHeader.append(this.orientationLabel);
+        controls.append(orientationHeader);
+
+        const rotateRow = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        rotateRow.append(this.makeToolButton('↶ 90°', 'Rotate left 90°', () => this.rotatePreview(-90)));
+        rotateRow.append(this.makeToolButton('↷ 90°', 'Rotate right 90°', () => this.rotatePreview(90)));
+        controls.append(rotateRow);
+
+        const mirrorRow = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        this.mirrorHorizontalButton = this.makeToolButton('↔ Left / Right', 'Mirror left and right', () => {
+            if (this.loadingConfig)
+                return;
+            this.mirrorHorizontalValue = this.mirrorHorizontalButton.get_active();
+            this.transformChanged();
+        }, true);
+        mirrorRow.append(this.mirrorHorizontalButton);
+        this.mirrorVerticalButton = this.makeToolButton('↕ Top / Bottom', 'Mirror top and bottom', () => {
+            if (this.loadingConfig)
+                return;
+            this.mirrorVerticalValue = this.mirrorVerticalButton.get_active();
+            this.transformChanged();
+        }, true);
+        mirrorRow.append(this.mirrorVerticalButton);
+        controls.append(mirrorRow);
+
+        const resetRow = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        const resetButton = this.makeButton('Reset orientation', () => this.resetTransform());
+        resetButton.add_css_class('flat');
+        resetRow.append(resetButton);
+        controls.append(resetRow);
+
+        const actionRow = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        this.showButton = this.makeButton('Show on LCD', () => this.showSelectedFile());
+        this.showButton.add_css_class('suggested-action');
+        this.showButton.set_hexpand(true);
+        this.showButton.set_sensitive(false);
+        actionRow.append(this.showButton);
+        actionRow.append(this.makeButton('Stop', () => this.stopCurrentContent()));
+        controls.append(actionRow);
+
+        const separator = new Gtk.Separator({orientation: Gtk.Orientation.HORIZONTAL});
+        controls.append(separator);
+        const live = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        live.append(new Gtk.Label({label: 'System dashboard', xalign: 0, hexpand: true}));
+        this.dashboardStatus = new Gtk.Label({label: 'Stopped', xalign: 1});
+        this.dashboardStatus.add_css_class('dim-label');
+        live.append(this.dashboardStatus);
+        this.startDashboardButton = this.makeButton('Start', () => this.startDashboard());
+        this.stopDashboardButton = this.makeButton('Stop', () => this.stopCurrentContent());
+        this.stopDashboardButton.set_sensitive(false);
+        live.append(this.startDashboardButton);
+        live.append(this.stopDashboardButton);
+        controls.append(live);
+        return outer;
+    }
+
+    buildStorageSection() {
+        const {outer, body} = this.makeSection('Library');
+        const top = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        top.append(new Gtk.Label({label: 'Uploaded animations and videos', xalign: 0, hexpand: true}));
+        top.append(this.makeButton('Refresh', () => this.refreshFiles()));
+        body.append(top);
+
+        const fileScroller = new Gtk.ScrolledWindow({min_content_height: 160, hexpand: true, vexpand: false});
+        this.fileList = new Gtk.ListBox({selection_mode: Gtk.SelectionMode.SINGLE});
+        this.showFileListMessage('Loading…');
+        fileScroller.set_child(this.fileList);
+        body.append(fileScroller);
+
+        const actions = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        actions.append(this.makeButton('Play selected', () => this.playSelectedRemote()));
+        const deleteButton = this.makeButton('Delete selected', () => this.confirmDeleteSelected());
+        deleteButton.add_css_class('destructive-action');
+        actions.append(deleteButton);
+        body.append(actions);
+        return outer;
+    }
+
+    buildLogSection() {
+        const {outer, body} = this.makeSection('Activity');
+        const row = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 8});
+        this.spinner = new Gtk.Spinner({spinning: false});
+        row.append(this.spinner);
+        this.activityLabel = new Gtk.Label({label: 'Ready', xalign: 0, hexpand: true});
+        row.append(this.activityLabel);
+        body.append(row);
+
+        const scroller = new Gtk.ScrolledWindow({min_content_height: 150, vexpand: false});
+        this.logView = new Gtk.TextView({editable: false, cursor_visible: false, monospace: true, wrap_mode: Gtk.WrapMode.WORD_CHAR});
+        scroller.set_child(this.logView);
+        body.append(scroller);
+        return outer;
+    }
+
+    cliArgs(commandArgs) {
+        return [...commandArgs];
+    }
+
+    currentTransform() {
+        return {
+            rotation: this.rotation,
+            mirrorHorizontal: this.mirrorHorizontalValue,
+            mirrorVertical: this.mirrorVerticalValue,
+        };
+    }
+
+    transformArgs() {
+        const transform = this.currentTransform();
+        return [
+            '--rotation', String(transform.rotation),
+            '--mirror-horizontal', transform.mirrorHorizontal ? 'on' : 'off',
+            '--mirror-vertical', transform.mirrorVertical ? 'on' : 'off',
+        ];
+    }
+
+    startupTransformArgs() {
+        return [
+            '--rotation', String(this.startupRotation),
+            '--mirror-horizontal', this.startupMirrorHorizontalValue ? 'on' : 'off',
+            '--mirror-vertical', this.startupMirrorVerticalValue ? 'on' : 'off',
+        ];
+    }
+
+    rotateStartup(delta) {
+        this.startupRotation = (this.startupRotation + delta + 360) % 360;
+        this.startupOrientationLabel.set_label(`${this.startupRotation}°`);
+        this.refreshStartupPreview();
+    }
+
+    resetStartupTransform() {
+        this.loadingConfig = true;
+        this.startupRotation = 0;
+        this.startupMirrorHorizontalValue = false;
+        this.startupMirrorVerticalValue = false;
+        this.startupOrientationLabel.set_label('0°');
+        this.startupMirrorHorizontalButton.set_active(false);
+        this.startupMirrorVerticalButton.set_active(false);
+        this.loadingConfig = false;
+        this.refreshStartupPreview();
+    }
+
+    refreshStartupPreview() {
+        const generation = ++this.startupPreviewGeneration;
+        if (this.startupPreviewProc) {
+            try {
+                this.startupPreviewProc.force_exit();
+            } catch (_) {
+                // The previous startup preview may already be exiting.
+            }
+            this.startupPreviewProc = null;
+        }
+        this.stopFramePreview('startup');
+        this.startupPreviewPicture.set_paintable(null);
+        if (this.startupActivePreviewPath) {
+            this.cleanupPreviewFile(this.startupActivePreviewPath);
+            this.startupActivePreviewPath = null;
+        }
+        if (!this.startupSelectedFile || !this.startupSelectedKind) {
+            this.startupPreviewSpinner.stop();
+            this.startupPreviewSpinner.set_visible(false);
+            this.startupPreviewStack.set_visible_child_name('empty');
+            return;
+        }
+
+        this.startupPreviewSpinner.set_visible(true);
+        this.startupPreviewSpinner.start();
+        const suffix = this.startupSelectedKind === 'animated' ? '.mp4' : '.png';
+        const output = GLib.build_filenamev([
+            GLib.get_tmp_dir(),
+            `frozr-gui-startup-preview-${GLib.get_monotonic_time()}-${generation}${suffix}`,
+        ]);
+        this.previewTempPaths.add(output);
+        const args = [CLI, 'preview', this.startupSelectedFile, output, ...this.startupTransformArgs()];
+        let proc;
+        try {
+            proc = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+        } catch (error) {
+            this.startupPreviewSpinner.stop();
+            this.startupPreviewSpinner.set_visible(false);
+            this.appendLog(`Startup preview failed: ${error.message}`);
+            this.cleanupPreviewFile(output);
+            return;
+        }
+        this.startupPreviewProc = proc;
+        proc.communicate_utf8_async(null, null, (source, result) => {
+            let stderr = '';
+            let success = false;
+            try {
+                const [, , err] = source.communicate_utf8_finish(result);
+                stderr = err || '';
+                success = source.get_successful();
+            } catch (error) {
+                stderr = error.message;
+            }
+            if (this.startupPreviewProc === source)
+                this.startupPreviewProc = null;
+            if (generation !== this.startupPreviewGeneration) {
+                this.cleanupPreviewFile(output);
+                return;
+            }
+            this.startupPreviewSpinner.stop();
+            this.startupPreviewSpinner.set_visible(false);
+            if (!success) {
+                if (stderr.trim())
+                    this.appendLog(`Startup preview failed: ${stderr.trim()}`);
+                this.startupPreviewStack.set_visible_child_name('empty');
+                this.cleanupPreviewFile(output);
+                return;
+            }
+            try {
+                if (this.startupSelectedKind === 'animated') {
+                    this.startupActivePreviewPath = output;
+                    this.startFramePreview(output, 'startup', generation);
+                } else {
+                    const texture = Gdk.Texture.new_from_file(Gio.File.new_for_path(output));
+                    this.startupPreviewPicture.set_paintable(texture);
+                    this.startupPreviewStack.set_visible_child_name('picture');
+                    this.cleanupPreviewFile(output);
+                }
+            } catch (error) {
+                this.appendLog(`Startup preview failed: ${error.message}`);
+                this.startupPreviewStack.set_visible_child_name('empty');
+                this.cleanupPreviewFile(output);
+            }
+        });
+    }
+
+    rotatePreview(delta) {
+        this.rotation = (this.rotation + delta + 360) % 360;
+        this.transformChanged();
+    }
+
+    resetTransform() {
+        this.loadingConfig = true;
+        this.rotation = 0;
+        this.mirrorHorizontalValue = false;
+        this.mirrorVerticalValue = false;
+        this.mirrorHorizontalButton.set_active(false);
+        this.mirrorVerticalButton.set_active(false);
+        this.loadingConfig = false;
+        this.transformChanged();
+    }
+
+    transformChanged() {
+        this.orientationLabel.set_label(`${this.rotation}°`);
+        this.saveTransformConfig();
+        this.refreshPreview();
+    }
+
+    saveTransformConfig() {
+        if (this.loadingConfig)
+            return;
+        this.pendingTransformSave = this.currentTransform();
+        this.drainTransformSave();
+    }
+
+    drainTransformSave() {
+        if (this.transformSaveProc || !this.pendingTransformSave)
+            return;
+        const transform = this.pendingTransformSave;
+        this.pendingTransformSave = null;
+        const args = [
+            CLI, 'config', 'transform', String(transform.rotation),
+            transform.mirrorHorizontal ? 'on' : 'off',
+            transform.mirrorVertical ? 'on' : 'off',
+        ];
+        try {
+            const proc = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_PIPE);
+            this.transformSaveProc = proc;
+            proc.communicate_utf8_async(null, null, (source, result) => {
+                try {
+                    const [, , stderr] = source.communicate_utf8_finish(result);
+                    if (!source.get_successful() && stderr)
+                        this.appendLog(stderr);
+                } catch (error) {
+                    this.appendLog(`Cannot save orientation: ${error.message}`);
+                }
+                if (this.transformSaveProc === source)
+                    this.transformSaveProc = null;
+                this.drainTransformSave();
+            });
+        } catch (error) {
+            this.transformSaveProc = null;
+            this.appendLog(`Cannot save orientation: ${error.message}`);
+            this.drainTransformSave();
+        }
+    }
+
+    refreshPreview() {
+        const generation = ++this.previewGeneration;
+        if (this.previewProc) {
+            try {
+                this.previewProc.force_exit();
+            } catch (_) {
+                // The previous preview may already be exiting.
+            }
+            this.previewProc = null;
+        }
+        this.stopFramePreview('after');
+        this.previewPicture.set_paintable(null);
+        if (this.activePreviewPath) {
+            this.cleanupPreviewFile(this.activePreviewPath);
+            this.activePreviewPath = null;
+        }
+        if (!this.selectedFile || !this.selectedKind) {
+            this.previewSpinner.stop();
+            this.previewSpinner.set_visible(false);
+            this.previewStack.set_visible_child_name('empty');
+            return;
+        }
+
+        this.previewSpinner.set_visible(true);
+        this.previewSpinner.start();
+        const suffix = this.selectedKind === 'animated' ? '.mp4' : '.png';
+        const output = GLib.build_filenamev([
+            GLib.get_tmp_dir(),
+            `frozr-gui-preview-${GLib.get_monotonic_time()}-${generation}${suffix}`,
+        ]);
+        this.previewTempPaths.add(output);
+        const args = [CLI, 'preview', this.selectedFile, output, ...this.transformArgs()];
+        let proc;
+        try {
+            proc = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+        } catch (error) {
+            this.previewSpinner.stop();
+            this.previewSpinner.set_visible(false);
+            this.appendLog(`Preview failed: ${error.message}`);
+            this.cleanupPreviewFile(output);
+            return;
+        }
+        this.previewProc = proc;
+        proc.communicate_utf8_async(null, null, (source, result) => {
+            let stderr = '';
+            let success = false;
+            try {
+                const [, , err] = source.communicate_utf8_finish(result);
+                stderr = err || '';
+                success = source.get_successful();
+            } catch (error) {
+                stderr = error.message;
+            }
+            if (this.previewProc === source)
+                this.previewProc = null;
+            if (generation !== this.previewGeneration) {
+                this.cleanupPreviewFile(output);
+                return;
+            }
+            this.previewSpinner.stop();
+            this.previewSpinner.set_visible(false);
+            if (!success) {
+                if (stderr.trim())
+                    this.appendLog(`Preview failed: ${stderr.trim()}`);
+                this.previewStack.set_visible_child_name('empty');
+                this.cleanupPreviewFile(output);
+                return;
+            }
+            try {
+                if (this.selectedKind === 'animated') {
+                    this.activePreviewPath = output;
+                    this.startFramePreview(output, 'after', generation);
+                } else {
+                    const texture = Gdk.Texture.new_from_file(Gio.File.new_for_path(output));
+                    this.previewPicture.set_paintable(texture);
+                    this.previewStack.set_visible_child_name('picture');
+                    this.cleanupPreviewFile(output);
+                }
+            } catch (error) {
+                this.appendLog(`Preview failed: ${error.message}`);
+                this.previewStack.set_visible_child_name('empty');
+                this.cleanupPreviewFile(output);
+            }
+        });
+    }
+
+    stopFramePreview(kind) {
+        const startup = kind === 'startup';
+        const procName = startup ? 'startupFrameProc' : 'previewFrameProc';
+        const timerName = startup ? 'startupFrameTimerId' : 'previewFrameTimerId';
+        const dirName = startup ? 'startupFrameDir' : 'previewFrameDir';
+        const framesName = startup ? 'startupPreviewFrames' : 'previewFrames';
+
+        if (this[procName]) {
+            try {
+                this[procName].force_exit();
+            } catch (_) {
+                // The frame extractor may already be exiting.
+            }
+            this[procName] = null;
+        }
+        if (this[timerName]) {
+            GLib.source_remove(this[timerName]);
+            this[timerName] = 0;
+        }
+        this[framesName] = [];
+        if (this[dirName]) {
+            this.cleanupPreviewDirectory(this[dirName]);
+            this[dirName] = null;
+        }
+    }
+
+    cleanupPreviewDirectory(path) {
+        if (!path)
+            return;
+        const dir = Gio.File.new_for_path(path);
+        try {
+            const enumerator = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+            let info;
+            while ((info = enumerator.next_file(null)) !== null) {
+                try {
+                    dir.get_child(info.get_name()).delete(null);
+                } catch (_) {
+                    // Best-effort cleanup.
+                }
+            }
+            enumerator.close(null);
+            dir.delete(null);
+        } catch (_) {
+            // Best-effort cleanup.
+        }
+    }
+
+    startFramePreview(sourcePath, kind, generation) {
+        const startup = kind === 'startup';
+        const picture = startup ? this.startupPreviewPicture : this.previewPicture;
+        const stack = startup ? this.startupPreviewStack : this.previewStack;
+        const procName = startup ? 'startupFrameProc' : 'previewFrameProc';
+        const timerName = startup ? 'startupFrameTimerId' : 'previewFrameTimerId';
+        const dirName = startup ? 'startupFrameDir' : 'previewFrameDir';
+        const framesName = startup ? 'startupPreviewFrames' : 'previewFrames';
+        const generationName = startup ? 'startupPreviewGeneration' : 'previewGeneration';
+        const activePathName = startup ? 'startupActivePreviewPath' : 'activePreviewPath';
+        const prefix = startup ? 'frozr-startup-frames' : 'frozr-after-frames';
+        const ffmpeg = GLib.find_program_in_path('ffmpeg');
+        if (!ffmpeg)
+            throw new Error('ffmpeg is required for animated preview');
+
+        this.stopFramePreview(kind);
+        const dir = GLib.build_filenamev([
+            GLib.get_tmp_dir(),
+            `${prefix}-${GLib.get_monotonic_time()}-${generation}`,
+        ]);
+        if (GLib.mkdir_with_parents(dir, 0o700) !== 0)
+            throw new Error('Cannot create animated preview frame directory');
+        this[dirName] = dir;
+
+        const pattern = GLib.build_filenamev([dir, 'frame-%04d.png']);
+        const args = [
+            ffmpeg, '-v', 'error', '-i', sourcePath,
+            '-t', '6', '-vf', 'fps=24,scale=360:360:flags=lanczos',
+            '-an', '-vsync', '0', pattern,
+        ];
+        const proc = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_PIPE);
+        this[procName] = proc;
+        proc.communicate_utf8_async(null, null, (source, result) => {
+            let stderr = '';
+            let success = false;
+            try {
+                const [, , err] = source.communicate_utf8_finish(result);
+                stderr = err || '';
+                success = source.get_successful();
+            } catch (error) {
+                stderr = error.message;
+            }
+            if (this[procName] === source)
+                this[procName] = null;
+            if (generation !== this[generationName]) {
+                this.cleanupPreviewDirectory(dir);
+                if (this[dirName] === dir)
+                    this[dirName] = null;
+                return;
+            }
+            if (this[activePathName] === sourcePath) {
+                this.cleanupPreviewFile(sourcePath);
+                this[activePathName] = null;
+            }
+            if (!success) {
+                if (stderr.trim())
+                    this.appendLog(`Animated preview frames failed: ${stderr.trim()}`);
+                this.cleanupPreviewDirectory(dir);
+                if (this[dirName] === dir)
+                    this[dirName] = null;
+                stack.set_visible_child_name('empty');
+                return;
+            }
+
+            try {
+                const file = Gio.File.new_for_path(dir);
+                const enumerator = file.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+                const names = [];
+                let info;
+                while ((info = enumerator.next_file(null)) !== null) {
+                    const name = info.get_name();
+                    if (name.startsWith('frame-') && name.endsWith('.png'))
+                        names.push(name);
+                }
+                enumerator.close(null);
+                names.sort();
+                const textures = names.map(name => Gdk.Texture.new_from_file(file.get_child(name)));
+                if (textures.length < 2)
+                    throw new Error('Animated preview produced fewer than two frames');
+                this[framesName] = textures;
+                picture.set_paintable(textures[0]);
+                stack.set_visible_child_name('picture');
+                let index = 0;
+                this[timerName] = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 42, () => {
+                    if (generation !== this[generationName] || this[framesName] !== textures) {
+                        this[timerName] = 0;
+                        return GLib.SOURCE_REMOVE;
+                    }
+                    index = (index + 1) % textures.length;
+                    picture.set_paintable(textures[index]);
+                    return GLib.SOURCE_CONTINUE;
+                });
+            } catch (error) {
+                this.appendLog(`Animated preview failed: ${error.message}`);
+                this.stopFramePreview(kind);
+                stack.set_visible_child_name('empty');
+            }
+        });
+    }
+
+    cleanupPreviewFile(path) {
+        this.previewTempPaths.delete(path);
+        if (!pathExists(path))
+            return;
+        try {
+            Gio.File.new_for_path(path).delete(null);
+        } catch (_) {
+            // Best-effort cleanup.
+        }
+    }
+
+    cleanupPreviewFiles() {
+        if (this.contentInfoProc) {
+            try {
+                this.contentInfoProc.force_exit();
+            } catch (_) {
+                // Best-effort shutdown.
+            }
+            this.contentInfoProc = null;
+        }
+        if (this.startupContentInfoProc) {
+            try {
+                this.startupContentInfoProc.force_exit();
+            } catch (_) {
+                // Best-effort shutdown.
+            }
+            this.startupContentInfoProc = null;
+        }
+        if (this.startupPreviewProc) {
+            try {
+                this.startupPreviewProc.force_exit();
+            } catch (_) {
+                // Best-effort shutdown.
+            }
+            this.startupPreviewProc = null;
+        }
+        this.stopFramePreview('startup');
+        this.startupPreviewPicture.set_paintable(null);
+        if (this.startupActivePreviewPath) {
+            this.cleanupPreviewFile(this.startupActivePreviewPath);
+            this.startupActivePreviewPath = null;
+        }
+        if (this.previewProc) {
+            try {
+                this.previewProc.force_exit();
+            } catch (_) {
+                // Best-effort shutdown.
+            }
+            this.previewProc = null;
+        }
+        this.stopFramePreview('after');
+        this.previewPicture.set_paintable(null);
+        this.activePreviewPath = null;
+        for (const path of [...this.previewTempPaths])
+            this.cleanupPreviewFile(path);
+    }
+
+    setBusy(delta, label = null) {
+        this.busy = Math.max(0, this.busy + delta);
+        this.spinner.set_spinning(this.busy > 0);
+        if (label)
+            this.activityLabel.set_label(label);
+        else if (this.busy === 0)
+            this.activityLabel.set_label('Ready');
+    }
+
+    appendLog(text) {
+        if (!text)
+            return;
+        const buffer = this.logView.get_buffer();
+        const [, end] = buffer.get_bounds();
+        buffer.insert(end, `${text.trim()}\n`, -1);
+    }
+
+    runCli(commandArgs, callback = null) {
+        const args = this.cliArgs(commandArgs);
+        const argv = [CLI, ...args];
+        this.appendLog(`$ frozrctl ${args.join(' ')}`);
+        this.setBusy(1, commandArgs[0]);
+        let proc;
+        try {
+            proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+        } catch (error) {
+            this.setBusy(-1);
+            this.appendLog(`error: ${error.message}`);
+            if (callback)
+                callback(false, '', error.message);
+            return;
+        }
+        proc.communicate_utf8_async(null, null, (source, result) => {
+            let stdout = '';
+            let stderr = '';
+            let success = false;
+            try {
+                [, stdout, stderr] = source.communicate_utf8_finish(result);
+                success = source.get_successful();
+            } catch (error) {
+                stderr = error.message;
+            }
+            this.setBusy(-1);
+            if (stdout)
+                this.appendLog(stdout);
+            if (stderr)
+                this.appendLog(stderr);
+            if (callback)
+                callback(success, stdout || '', stderr || '');
+        });
+    }
+
+    startDashboard() {
+        if (this.dashboardProc) {
+            this.appendLog('Live dashboard is already running.');
+            return;
+        }
+        const args = this.cliArgs([
+            'dashboard',
+            '--brightness', String(Math.round(this.brightness.get_value())),
+            '--interval', '1000',
+            '--quiet',
+            ...this.transformArgs(),
+        ]);
+        this.appendLog(`$ frozrctl ${args.join(' ')}`);
+        let proc;
+        try {
+            proc = Gio.Subprocess.new(
+                [CLI, ...args],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+        } catch (error) {
+            this.appendLog(`error: ${error.message}`);
+            return;
+        }
+        this.dashboardProc = proc;
+        this.dashboardStatus.set_label('Running');
+        this.startDashboardButton.set_sensitive(false);
+        this.stopDashboardButton.set_sensitive(true);
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 800, () => {
+            if (this.dashboardProc === proc)
+                this.loadConfig();
+            return GLib.SOURCE_REMOVE;
+        });
+        proc.communicate_utf8_async(null, null, (source, result) => {
+            let stdout = '';
+            let stderr = '';
+            let success = false;
+            try {
+                [, stdout, stderr] = source.communicate_utf8_finish(result);
+                success = source.get_successful();
+            } catch (error) {
+                stderr = error.message;
+            }
+            if (stdout)
+                this.appendLog(stdout);
+            if (stderr)
+                this.appendLog(stderr);
+            if (this.dashboardProc === source)
+                this.dashboardProc = null;
+            this.dashboardStatus.set_label(success ? 'Stopped' : 'Stopped / error');
+            this.startDashboardButton.set_sensitive(true);
+            this.stopDashboardButton.set_sensitive(false);
+        });
+    }
+
+    stopDashboard() {
+        if (!this.dashboardProc)
+            return;
+        this.appendLog('Stopping live dashboard…');
+        try {
+            this.dashboardProc.force_exit();
+        } catch (error) {
+            this.appendLog(`Cannot stop dashboard: ${error.message}`);
+        }
+    }
+
+    refreshStatus(refreshLibraryOnReady = false) {
+        this.runCli(['status'], (ok, stdout, stderr) => {
+            this.statusLabel.set_label(ok ? stdout.trim().replace(/\n/g, ' · ') : `Not ready: ${stderr.trim() || 'device not detected'}`);
+            if (!refreshLibraryOnReady)
+                return;
+            if (ok)
+                this.refreshFiles();
+            else
+                this.showFileListMessage('Device unavailable');
+        });
+    }
+
+    loadConfig() {
+        this.loadingConfig = true;
+        this.runCli(['config'], (ok, stdout) => {
+            if (ok) {
+                try {
+                    const config = JSON.parse(stdout);
+                    if (Number.isFinite(config.brightness))
+                        this.brightness.set_value(config.brightness);
+                    this.rotation = [0, 90, 180, 270].includes(Number(config.rotation)) ? Number(config.rotation) : 0;
+                    this.mirrorHorizontalValue = Boolean(config.mirrorHorizontal);
+                    this.mirrorVerticalValue = Boolean(config.mirrorVertical);
+                    this.orientationLabel.set_label(`${this.rotation}°`);
+                    this.mirrorHorizontalButton.set_active(this.mirrorHorizontalValue);
+                    this.mirrorVerticalButton.set_active(this.mirrorVerticalValue);
+                    const startup = config.startupDisplay || config.powerOffDisplay || {};
+                    this.startupRotation = [0, 90, 180, 270].includes(Number(startup.rotation)) ? Number(startup.rotation) : 0;
+                    this.startupMirrorHorizontalValue = Boolean(startup.mirrorHorizontal);
+                    this.startupMirrorVerticalValue = Boolean(startup.mirrorVertical);
+                    this.startupOrientationLabel.set_label(`${this.startupRotation}°`);
+                    this.startupMirrorHorizontalButton.set_active(this.startupMirrorHorizontalValue);
+                    this.startupMirrorVerticalButton.set_active(this.startupMirrorVerticalValue);
+                    this.updateStartupStatus(config);
+                    this.updateAfterLoginStatus(config);
+                } catch (error) {
+                    this.appendLog(`Cannot parse config: ${error.message}`);
+                }
+            }
+            this.loadingConfig = false;
+        });
+    }
+
+    chooseFile(title) {
+        const chooser = new Gtk.FileChooserNative({
+            title,
+            transient_for: this.window,
+            action: Gtk.FileChooserAction.OPEN,
+            accept_label: 'Open',
+            cancel_label: 'Cancel',
+        });
+        chooser.connect('response', (dialog, response) => {
+            if (response === Gtk.ResponseType.ACCEPT) {
+                const file = dialog.get_file();
+                this.selectedFile = file ? file.get_path() : null;
+                this.selectedKind = null;
+                this.selectedCodec = null;
+                this.fileLabel.set_label(this.selectedFile ? GLib.path_get_basename(this.selectedFile) : 'Nothing selected');
+                this.showButton.set_sensitive(false);
+                this.refreshPreview();
+                this.inspectSelectedFile();
+            }
+            dialog.destroy();
+        });
+        chooser.show();
+    }
+
+    inspectSelectedFile() {
+        if (!this.selectedFile)
+            return;
+        if (this.contentInfoProc) {
+            try {
+                this.contentInfoProc.force_exit();
+            } catch (_) {
+                // Previous probe may already be exiting.
+            }
+            this.contentInfoProc = null;
+        }
+        const path = this.selectedFile;
+        this.previewSpinner.set_visible(true);
+        this.previewSpinner.start();
+        let proc;
+        try {
+            proc = Gio.Subprocess.new(
+                [CLI, 'content-info', path],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+        } catch (error) {
+            this.previewSpinner.stop();
+            this.previewSpinner.set_visible(false);
+            this.appendLog(`Cannot inspect content: ${error.message}`);
+            return;
+        }
+        this.contentInfoProc = proc;
+        proc.communicate_utf8_async(null, null, (source, result) => {
+            let stdout = '';
+            let stderr = '';
+            let success = false;
+            try {
+                [, stdout, stderr] = source.communicate_utf8_finish(result);
+                success = source.get_successful();
+            } catch (error) {
+                stderr = error.message;
+            }
+            if (this.contentInfoProc === source)
+                this.contentInfoProc = null;
+            if (path !== this.selectedFile)
+                return;
+            if (!success) {
+                this.previewSpinner.stop();
+                this.previewSpinner.set_visible(false);
+                this.appendLog(`Cannot inspect content: ${stderr.trim() || 'unknown error'}`);
+                return;
+            }
+            try {
+                const info = JSON.parse(stdout);
+                this.selectedKind = info.kind === 'animated' ? 'animated' : 'static';
+                this.selectedCodec = info.codec || null;
+                this.showButton.set_sensitive(true);
+                this.refreshPreview();
+            } catch (error) {
+                this.previewSpinner.stop();
+                this.previewSpinner.set_visible(false);
+                this.appendLog(`Cannot parse content info: ${error.message}`);
+            }
+        });
+    }
+
+    chooseStartupFile() {
+        const chooser = new Gtk.FileChooserNative({
+            title: 'Select startup content',
+            transient_for: this.window,
+            action: Gtk.FileChooserAction.OPEN,
+            accept_label: 'Open',
+            cancel_label: 'Cancel',
+        });
+        chooser.connect('response', (dialog, response) => {
+            if (response === Gtk.ResponseType.ACCEPT) {
+                const file = dialog.get_file();
+                this.startupSelectedFile = file ? file.get_path() : null;
+                this.startupSelectedKind = null;
+                this.startupSelectedCodec = null;
+                this.startupFileLabel.set_label(this.startupSelectedFile
+                    ? GLib.path_get_basename(this.startupSelectedFile)
+                    : 'Nothing selected');
+                this.startupUseButton.set_sensitive(false);
+                this.refreshStartupPreview();
+                this.inspectStartupSelectedFile();
+            }
+            dialog.destroy();
+        });
+        chooser.show();
+    }
+
+    inspectStartupSelectedFile() {
+        if (!this.startupSelectedFile)
+            return;
+        if (this.startupContentInfoProc) {
+            try {
+                this.startupContentInfoProc.force_exit();
+            } catch (_) {
+                // Previous probe may already be exiting.
+            }
+            this.startupContentInfoProc = null;
+        }
+        const path = this.startupSelectedFile;
+        let proc;
+        try {
+            proc = Gio.Subprocess.new(
+                [CLI, 'content-info', path],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+        } catch (error) {
+            this.appendLog(`Cannot inspect startup content: ${error.message}`);
+            return;
+        }
+        this.startupContentInfoProc = proc;
+        proc.communicate_utf8_async(null, null, (source, result) => {
+            let stdout = '';
+            let stderr = '';
+            let success = false;
+            try {
+                [, stdout, stderr] = source.communicate_utf8_finish(result);
+                success = source.get_successful();
+            } catch (error) {
+                stderr = error.message;
+            }
+            if (this.startupContentInfoProc === source)
+                this.startupContentInfoProc = null;
+            if (path !== this.startupSelectedFile)
+                return;
+            if (!success) {
+                this.appendLog(`Cannot inspect startup content: ${stderr.trim() || 'unknown error'}`);
+                return;
+            }
+            try {
+                const info = JSON.parse(stdout);
+                this.startupSelectedKind = info.kind === 'animated' ? 'animated' : 'static';
+                this.startupSelectedCodec = info.codec || null;
+                const name = GLib.path_get_basename(path);
+                const type = this.startupSelectedKind === 'animated' ? 'animation/video' : 'image';
+                this.startupFileLabel.set_label(`${name} · ${type}`);
+                this.startupUseButton.set_sensitive(true);
+                this.refreshStartupPreview();
+            } catch (error) {
+                this.appendLog(`Cannot parse startup content info: ${error.message}`);
+            }
+        });
+    }
+
+    updateStartupStatus(config) {
+        const saved = config.startupDisplay || config.powerOffDisplay || {mode: 'default'};
+        if (saved.mode === 'image') {
+            const name = saved.source ? GLib.path_get_basename(saved.source) : 'Image';
+            this.startupStatus.set_label(`${name} · image`);
+        } else if (saved.mode === 'media') {
+            const name = saved.source ? GLib.path_get_basename(saved.source) : 'Animation / video';
+            this.startupStatus.set_label(`${name} · animation/video`);
+        } else {
+            this.startupStatus.set_label('Device default');
+        }
+    }
+
+    setSelectedAsStartupDisplay() {
+        if (!this.startupSelectedFile || !this.startupSelectedKind) {
+            this.appendLog('Select startup content first.');
+            return;
+        }
+        if (this.dashboardProc) {
+            this.resumeDashboardAfterStartup = true;
+            this.stopDashboard();
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                this.setSelectedAsStartupDisplay();
+                return GLib.SOURCE_REMOVE;
+            });
+            return;
+        }
+        const mode = this.startupSelectedKind === 'static' ? 'image' : 'media';
+        const previousAction = this.lastAction;
+        const resumeDashboard = this.resumeDashboardAfterStartup;
+        this.resumeDashboardAfterStartup = false;
+        this.runCli([
+            'device-start', mode, this.startupSelectedFile,
+            '--brightness', String(Math.round(this.brightness.get_value())),
+            ...this.startupTransformArgs(),
+        ], ok => {
+            if (ok && mode === 'media')
+                this.refreshFiles();
+            this.restoreAfterStartupConfiguration(previousAction, resumeDashboard);
+        });
+    }
+
+    restoreAfterStartupConfiguration(previousAction, resumeDashboard) {
+        if (resumeDashboard) {
+            this.startDashboard();
+            return;
+        }
+        if (previousAction && previousAction.type !== 'dashboard') {
+            this.runCli(['restore'], () => this.loadConfig());
+            return;
+        }
+        this.loadConfig();
+    }
+
+    resetStartupDisplay() {
+        this.runCli(['device-start', 'default'], ok => {
+            if (ok)
+                this.loadConfig();
+        });
+    }
+
+    updateAfterLoginStatus(config) {
+        const action = config.lastAction;
+        this.lastAction = action || null;
+        if (!action) {
+            this.afterLoginStatus.set_label('Nothing saved');
+            return;
+        }
+        if (action.type === 'image') {
+            const name = action.source ? GLib.path_get_basename(action.source) : 'Image';
+            this.afterLoginStatus.set_label(`${name} · image`);
+        } else if (action.type === 'remote-media') {
+            const name = action.target ? GLib.path_get_basename(action.target) : 'Animation / video';
+            this.afterLoginStatus.set_label(`${name} · animation/video`);
+        } else if (action.type === 'dashboard') {
+            this.afterLoginStatus.set_label('System dashboard');
+        } else if (action.type === 'stopped') {
+            this.afterLoginStatus.set_label('Stopped');
+        } else {
+            this.afterLoginStatus.set_label('Saved content');
+        }
+    }
+
+    requireSelectedFile() {
+        if (!this.selectedFile) {
+            this.appendLog('Select a local file first.');
+            return false;
+        }
+        return true;
+    }
+
+    selectedFileIsStaticImage() {
+        return this.selectedKind === 'static';
+    }
+
+    showSelectedFile() {
+        if (!this.requireSelectedFile())
+            return;
+
+        if (this.dashboardProc) {
+            this.stopDashboard();
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                this.showSelectedFile();
+                return GLib.SOURCE_REMOVE;
+            });
+            return;
+        }
+
+        if (this.selectedFileIsStaticImage()) {
+            this.runCli([
+                'image', this.selectedFile,
+                '--brightness', String(Math.round(this.brightness.get_value())),
+                ...this.transformArgs(),
+            ], ok => {
+                if (ok)
+                    this.loadConfig();
+            });
+            return;
+        }
+
+        this.runCli([
+            'media', this.selectedFile, '--background',
+            '--brightness', String(Math.round(this.brightness.get_value())),
+            ...this.transformArgs(),
+        ], ok => {
+            if (ok) {
+                this.refreshFiles();
+                this.loadConfig();
+            }
+        });
+    }
+
+    stopCurrentContent() {
+        if (this.dashboardProc) {
+            this.stopDashboard();
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                if (this.dashboardProc)
+                    return GLib.SOURCE_CONTINUE;
+                this.runCli(['stop'], () => this.loadConfig());
+                return GLib.SOURCE_REMOVE;
+            });
+            return;
+        }
+        this.runCli(['stop'], () => this.loadConfig());
+    }
+
+    selectedRoot() {
+        return ROOTS[0];
+    }
+
+    clearFileList() {
+        let child = this.fileList.get_first_child();
+        while (child) {
+            const next = child.get_next_sibling();
+            this.fileList.remove(child);
+            child = next;
+        }
+    }
+
+    showFileListMessage(message) {
+        this.clearFileList();
+        const row = new Gtk.ListBoxRow({selectable: false, activatable: false});
+        const label = new Gtk.Label({label: message, xalign: 0, margin_top: 10, margin_bottom: 10, margin_start: 8, margin_end: 8});
+        label.add_css_class('dim-label');
+        row.set_child(label);
+        this.fileList.append(row);
+    }
+
+    refreshFiles() {
+        const root = this.selectedRoot();
+        this.showFileListMessage('Loading…');
+        this.runCli(['ls', root], (ok, stdout) => {
+            if (!ok) {
+                this.showFileListMessage('Couldn’t load library');
+                return;
+            }
+            this.clearFileList();
+            let count = 0;
+            for (const line of stdout.split('\n').map(v => v.trim()).filter(Boolean)) {
+                if (line.startsWith('frozr-startup-'))
+                    continue;
+                const row = new Gtk.ListBoxRow();
+                row.set_child(new Gtk.Label({label: line, xalign: 0, margin_top: 7, margin_bottom: 7, margin_start: 8, margin_end: 8}));
+                row._filename = line;
+                this.fileList.append(row);
+                count++;
+            }
+            if (count === 0)
+                this.showFileListMessage('No uploaded media');
+        });
+    }
+
+    selectedRemotePath() {
+        const row = this.fileList.get_selected_row();
+        if (!row || !row._filename) {
+            this.appendLog('Select an on-device file first.');
+            return null;
+        }
+        return `${this.selectedRoot()}${row._filename}`;
+    }
+
+    playSelectedRemote() {
+        const path = this.selectedRemotePath();
+        if (!path)
+            return;
+        this.runCli(['play', path, '--background'], ok => {
+            if (ok)
+                this.loadConfig();
+        });
+    }
+
+    confirmDeleteSelected() {
+        const path = this.selectedRemotePath();
+        if (!path)
+            return;
+        const dialog = new Adw.MessageDialog({
+            transient_for: this.window,
+            heading: 'Delete this LCD file?',
+            body: path,
+        });
+        dialog.add_response('cancel', 'Cancel');
+        dialog.add_response('delete', 'Delete');
+        dialog.set_default_response('cancel');
+        dialog.set_close_response('cancel');
+        dialog.set_response_appearance('delete', Adw.ResponseAppearance.DESTRUCTIVE);
+        dialog.connect('response', (_dialog, response) => {
+            if (response === 'delete') {
+                this.runCli(['rm', path], ok => {
+                    if (ok)
+                        this.refreshFiles();
+                });
+            }
+        });
+        dialog.present();
+    }
+
+    present() {
+        this.window.connect('close-request', () => {
+            this.stopDashboard();
+            this.cleanupPreviewFiles();
+            return false;
+        });
+        this.window.present();
+    }
+}
+
+const app = new Adw.Application({application_id: 'io.github.xeift.FrozrO2Linux'});
+let activated = false;
+app.connect('activate', () => {
+    activated = true;
+    try {
+        const existing = app.get_active_window();
+        if (existing) {
+            existing.present();
+            return;
+        }
+        const ui = new FrozrWindow(app);
+        ui.present();
+    } catch (error) {
+        printerr(`frozr-gui: failed to create the window: ${error.message}`);
+        if (error.stack)
+            printerr(error.stack);
+        app.quit();
+    }
+});
+
+const exitCode = app.run([]);
+if (!activated && exitCode === 0)
+    printerr('frozr-gui: application exited before activation; check the desktop session and D-Bus environment.');
+System.exit(exitCode);

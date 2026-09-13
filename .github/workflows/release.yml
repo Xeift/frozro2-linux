@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dpkg-dev \
+            ffmpeg \
+            gh \
+            gjs \
+            gir1.2-gtk-4.0 \
+            gir1.2-adw-1 \
+            python3-venv
+
+      - name: Run tests
+        run: |
+          python3 -m venv .venv
+          set -e
+          for test in tests/test*.py; do
+            .venv/bin/python "$test"
+          done
+
+      - name: Build Debian package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}" ./packaging/build-deb.sh
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME#v}"
+          DEB="dist/frozro2-linux_${VERSION}_all.deb"
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$DEB" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$DEB" \
+              --title "Frozr-O II Linux $GITHUB_REF_NAME" \
+              --generate-notes
+          fi

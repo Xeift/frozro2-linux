@@ -1,0 +1,2311 @@
+#!/usr/bin/gjs
+'use strict';
+
+// Working-name CLI for the XIGMATEK Frozr-O II / Turing Rev C LCD.
+// Kept under .data while the project name/repository are still undecided.
+
+imports.gi.versions.Pango = '1.0';
+
+const Gio = imports.gi.Gio;
+const GLib = imports.gi.GLib;
+const GdkPixbuf = imports.gi.GdkPixbuf;
+const Pango = imports.gi.Pango;
+const PangoCairo = imports.gi.PangoCairo;
+const Cairo = imports.cairo;
+
+const WIDTH = 480;
+const HEIGHT = 480;
+const BAUD = 115200;
+const PACKET_SIZE = 250;
+const RAW_CHUNK_SIZE = 249;
+const AWAKE_SERIAL = '20080411';
+const SLEEP_SERIAL = 'CT21INCH';
+const AWAKE_VIDPID = '1d6b:0121';
+const SLEEP_VIDPID = '1a86:ca21';
+const DEFAULT_VIDEO_ROOT = '/mnt/SDCARD/video/';
+const DEFAULT_IMAGE_ROOT = '/mnt/SDCARD/img/';
+
+const CMD = Object.freeze({
+    HELLO: 0x01,
+    STORAGE_INFO: 0x64,
+    LIST_DIR: 0x65,
+    DELETE_FILE: 0x66,
+    FILE_SIZE: 0x6e,
+    FILE_UPLOAD: 0x6f,
+    PLAY_VIDEO: 0x78,
+    STOP_VIDEO: 0x79,
+    DELTA_BITMAP: 0xcc,
+    STORAGE_PROBE: 0x7a,
+    SET_BRIGHTNESS: 0x7b,
+    OPTIONS: 0x7d,
+    PRE_UPDATE_BITMAP: 0x86,
+    PLAY_IMAGE: 0x8c,
+    STOP_MEDIA: 0x96,
+    DISPLAY_BITMAP_2INCH: 0xc8,
+    QUERY_STATUS: 0xcf,
+});
+
+function usage() {
+    print(`Usage: frozrctl [global options] COMMAND [args]\n\nGlobal options:\n  --device PATH       Use a specific tty device (for example /dev/ttyACM0)\n  --no-wake           Do not attempt to wake CT21INCH\n  --dry-run           Build/describe operations without touching the device\n  --verbose           Print protocol diagnostics\n  --help              Show this help\n\nCommands:\n  status                         Detect the LCD and print HELLO identity.\n  doctor                         Check runtime, ffmpeg, serial permissions, and device detection.\n  brightness N                   Set brightness to 0..100 and remember it locally.\n  image FILE [options]           Send one static image frame.\n  content-info FILE              Detect static vs animated visual content by frames, not extension.\n  preview FILE OUTPUT [options]  Render transformed PNG or looping MP4 preview without hardware.\n  media FILE [options]           Transcode/upload/verify/play animated image or video.\n  play DEVICE_PATH [--background] Play an already uploaded video.\n  dashboard [options]            Live CPU/GPU/RAM/time dashboard via delta frames.\n  stop                           Stop video/media playback.\n  ls [DEVICE_DIR]                List files on the LCD (default: /mnt/SDCARD/video/).\n  rm DEVICE_PATH                 Delete one LCD file, then verify by re-listing its directory.\n  file-size DEVICE_PATH          Query one remote file size.\n  storage                        Read firmware storage counters (0x64) and known roots.\n  device-config [options]        Save brightness/start-mode/flip/sleep-delay to the device.\n  device-start MODE [FILE]       Configure firmware-native default/image/video startup content.\n  config                         Print local settings.\n  config transform ROT H V       Save rotation plus horizontal/vertical mirror defaults.\n  restore                        Re-apply the last successful image/media action.\n\nimage/media/dashboard transform options:\n  --rotation DEG                 0, 90, 180, or 270 degrees clockwise\n  --mirror-horizontal on|off     mirror left/right\n  --mirror-vertical on|off       mirror top/bottom\n\nmedia options:\n  --target DEVICE_PATH           Destination (default: /mnt/SDCARD/video/<name>.mp4)\n  --brightness N                 0..100 (default: saved brightness)\n  --background                   AlphaMonitor theme/background playback flag (0x01)\n  --no-play                      Upload and verify only\n  --direct                       Upload MP4 bytes as-is; skip ffmpeg transcoding/transform\n\ndashboard options:\n  --brightness N                 0..100 (default: saved brightness)\n  --interval MS                  refresh period, 250..10000 (default: 1000)\n  --frames N                     stop after N frames; 0 means run until interrupted\n  --quiet                        suppress per-frame telemetry\n\ndevice-config options:\n  --brightness N                 0..100\n  --start-mode N                 firmware start mode byte 0..255\n  --flip on|off                  image flip byte\n  --sleep-delay N                firmware sleep-delay byte 0..255\n\nExamples:\n  frozrctl status\n  frozrctl brightness 35\n  frozrctl image ~/Pictures/pic.jpg --rotation 90\n  frozrctl media animation.gif --background --mirror-horizontal on\n  frozrctl dashboard --brightness 35 --rotation 270\n  frozrctl ls /mnt/SDCARD/video/\n  frozrctl rm /mnt/SDCARD/video/old.mp4\n  frozrctl device-start image ~/Pictures/off-screen.png\n  frozrctl device-start media ~/Pictures/off-screen.gif\n  frozrctl device-start default\n`);
+}
+
+function die(message) {
+    printerr(`error: ${message}`);
+    imports.system.exit(1);
+}
+
+function logVerbose(options, message) {
+    if (options.verbose)
+        printerr(`[debug] ${message}`);
+}
+
+function parseArgs(argv) {
+    const options = {
+        device: null,
+        wake: true,
+        dryRun: false,
+        verbose: false,
+        command: null,
+        args: [],
+    };
+
+    let i = 0;
+    while (i < argv.length) {
+        const arg = argv[i];
+        if (arg === '--help' && options.command === null) {
+            usage();
+            imports.system.exit(0);
+        }
+        if (options.command !== null) {
+            options.args.push(arg);
+            i++;
+            continue;
+        }
+        if (arg === '--device') {
+            if (++i >= argv.length)
+                die('--device requires a path');
+            options.device = argv[i++];
+        } else if (arg === '--no-wake') {
+            options.wake = false;
+            i++;
+        } else if (arg === '--dry-run') {
+            options.dryRun = true;
+            i++;
+        } else if (arg === '--verbose') {
+            options.verbose = true;
+            i++;
+        } else if (arg.startsWith('-')) {
+            die(`unknown global option: ${arg}`);
+        } else {
+            options.command = arg;
+            i++;
+        }
+    }
+
+    if (!options.command) {
+        usage();
+        imports.system.exit(1);
+    }
+    return options;
+}
+
+function runCapture(argv) {
+    const proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+    const [, stdout, stderr] = proc.communicate_utf8(null, null);
+    if (!proc.get_successful())
+        throw new Error((stderr || `command failed: ${argv.join(' ')}`).trim());
+    return stdout;
+}
+
+function pathExists(path) {
+    return GLib.file_test(path, GLib.FileTest.EXISTS);
+}
+
+function realUserHome() {
+    const sudoUser = GLib.getenv('SUDO_USER');
+    if (sudoUser && sudoUser !== 'root') {
+        try {
+            const row = runCapture(['/usr/bin/getent', 'passwd', sudoUser]).trim();
+            const fields = row.split(':');
+            if (fields.length >= 6 && fields[5])
+                return fields[5];
+        } catch (_) {
+            // Fall back to the current account's home.
+        }
+    }
+    return GLib.get_home_dir();
+}
+
+function restoreRealUserOwnership(path) {
+    const uid = GLib.getenv('SUDO_UID');
+    const gid = GLib.getenv('SUDO_GID');
+    if (!uid || !gid)
+        return;
+    try {
+        runCapture(['/usr/bin/chown', `${uid}:${gid}`, path]);
+    } catch (_) {
+        // Config is still usable by the current process; ownership repair is best-effort.
+    }
+}
+
+function configFilePath() {
+    const dir = GLib.build_filenamev([realUserHome(), '.config', 'frozr-linux']);
+    GLib.mkdir_with_parents(dir, 0o700);
+    restoreRealUserOwnership(dir);
+    return GLib.build_filenamev([dir, 'config.json']);
+}
+
+function defaultConfig() {
+    return {
+        version: 1,
+
+        brightness: 25,
+        rotation: 0,
+        mirrorHorizontal: false,
+        mirrorVertical: false,
+        deviceConfig: {
+            startMode: 0,
+            flip: false,
+            sleepDelay: 0,
+        },
+        startupDisplay: {
+            mode: 'default',
+            source: null,
+            target: null,
+        },
+        lastAction: null,
+    };
+}
+
+function normalizeRotation(value, option = 'rotation') {
+    const rotation = Number(value);
+    if (![0, 90, 180, 270].includes(rotation))
+        throw new Error(`${option} must be one of 0, 90, 180, or 270`);
+    return rotation;
+}
+
+function transformFromConfig(config = loadConfig()) {
+    return {
+        rotation: normalizeRotation(config.rotation ?? 0),
+        mirrorHorizontal: Boolean(config.mirrorHorizontal),
+        mirrorVertical: Boolean(config.mirrorVertical),
+    };
+}
+
+function startupTransformFromConfig(config = loadConfig()) {
+    const saved = config.startupDisplay || {};
+    return {
+        rotation: normalizeRotation(saved.rotation ?? 0),
+        mirrorHorizontal: Boolean(saved.mirrorHorizontal),
+        mirrorVertical: Boolean(saved.mirrorVertical),
+    };
+}
+
+function normalizeTransform(transform = {}) {
+    return {
+        rotation: normalizeRotation(transform.rotation ?? 0),
+        mirrorHorizontal: Boolean(transform.mirrorHorizontal),
+        mirrorVertical: Boolean(transform.mirrorVertical),
+    };
+}
+
+function saveTransform(transform) {
+    const normalized = normalizeTransform(transform);
+    const config = loadConfig();
+    config.rotation = normalized.rotation;
+    config.mirrorHorizontal = normalized.mirrorHorizontal;
+    config.mirrorVertical = normalized.mirrorVertical;
+    saveConfig(config);
+}
+
+function loadConfig() {
+    const path = configFilePath();
+    if (!pathExists(path))
+        return defaultConfig();
+    try {
+        const [, bytes] = GLib.file_get_contents(path);
+        const parsed = JSON.parse(new TextDecoder().decode(bytes));
+        const merged = Object.assign(defaultConfig(), parsed);
+        if (!parsed.startupDisplay && parsed.powerOffDisplay)
+            merged.startupDisplay = parsed.powerOffDisplay;
+        delete merged.powerOffDisplay;
+        delete merged.autoRestore;
+        return merged;
+    } catch (error) {
+        throw new Error(`cannot read local config ${path}: ${error.message}`);
+    }
+}
+
+function saveConfig(config) {
+    const path = configFilePath();
+    const text = `${JSON.stringify(config, null, 2)}\n`;
+    GLib.file_set_contents(path, text);
+    restoreRealUserOwnership(path);
+}
+
+function rememberAction(action) {
+    const config = loadConfig();
+    config.lastAction = action;
+    if (action.brightness !== undefined)
+        config.brightness = action.brightness;
+    saveConfig(config);
+}
+
+function localDeviceConfig(config = loadConfig()) {
+    const saved = config.deviceConfig || {};
+    return {
+        startMode: Number.isInteger(saved.startMode) ? saved.startMode : 0,
+        flip: Boolean(saved.flip),
+        sleepDelay: Number.isInteger(saved.sleepDelay) ? saved.sleepDelay : 0,
+    };
+}
+
+function rememberDeviceConfig(config, deviceConfig) {
+    config.deviceConfig = {
+        startMode: deviceConfig.startMode,
+        flip: Boolean(deviceConfig.flip),
+        sleepDelay: deviceConfig.sleepDelay,
+    };
+}
+
+function rememberStartupDisplay(mode, source = null, target = null, transform = null) {
+    const config = loadConfig();
+    config.startupDisplay = {
+        mode,
+        source,
+        target,
+        ...(transform ? {
+            rotation: transform.rotation,
+            mirrorHorizontal: transform.mirrorHorizontal,
+            mirrorVertical: transform.mirrorVertical,
+        } : {}),
+    };
+    if (transform && Number.isInteger(transform.brightness))
+        config.brightness = transform.brightness;
+    const deviceConfig = localDeviceConfig(config);
+    deviceConfig.startMode = mode === 'image' ? 1 : mode === 'media' ? 2 : 0;
+    rememberDeviceConfig(config, deviceConfig);
+    saveConfig(config);
+}
+
+function findFfmpeg() {
+    const fromPath = GLib.find_program_in_path('ffmpeg');
+    if (fromPath)
+        return fromPath;
+
+    // sudo commonly uses a narrower secure_path; keep the usual system locations explicit.
+    for (const candidate of ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg']) {
+        if (pathExists(candidate))
+            return candidate;
+    }
+    return null;
+}
+
+function findFfprobe() {
+    const fromPath = GLib.find_program_in_path('ffprobe');
+    if (fromPath)
+        return fromPath;
+    for (const candidate of ['/usr/bin/ffprobe', '/usr/local/bin/ffprobe']) {
+        if (pathExists(candidate))
+            return candidate;
+    }
+    return null;
+}
+
+function probeVisualContent(path) {
+    const ffprobe = findFfprobe();
+    if (!ffprobe)
+        throw new Error('ffprobe is required to detect animated image/video content. Ubuntu/Debian: sudo apt install ffmpeg.');
+    const text = runCapture([
+        ffprobe,
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-count_frames',
+        '-read_intervals', '%+#2',
+        '-show_entries', 'stream=codec_name,codec_type,nb_read_frames,nb_frames,duration',
+        '-of', 'json',
+        path,
+    ]);
+    const parsed = JSON.parse(text);
+    const stream = parsed.streams?.[0];
+    if (!stream || stream.codec_type !== 'video')
+        throw new Error(`no visual stream found in ${path}`);
+    const framesSeen = Number(stream.nb_read_frames ?? stream.nb_frames ?? 0);
+    const stillCodecs = new Set(['png', 'mjpeg', 'jpeg', 'bmp', 'webp', 'tiff', 'gif', 'apng', 'ppm', 'pgm', 'pbm']);
+    const animated = framesSeen >= 2 ? true : framesSeen === 1 ? false : !stillCodecs.has(stream.codec_name);
+    return {
+        kind: animated ? 'animated' : 'static',
+        animated,
+        codec: stream.codec_name || 'unknown',
+        framesSeen: Number.isFinite(framesSeen) ? framesSeen : 0,
+    };
+}
+
+function canonicalPath(path) {
+    return GLib.canonicalize_filename(path, GLib.get_current_dir());
+}
+
+function readLink(path) {
+    try {
+        return GLib.file_read_link(path);
+    } catch (_) {
+        return null;
+    }
+}
+
+function listSerialLinks() {
+    const dir = Gio.File.new_for_path('/dev/serial/by-id');
+    try {
+        const enumerator = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+        const found = [];
+        while (true) {
+            const info = enumerator.next_file(null);
+            if (info === null)
+                break;
+            const name = info.get_name();
+            const linkPath = `/dev/serial/by-id/${name}`;
+            found.push({name, linkPath, target: readLink(linkPath)});
+        }
+        enumerator.close(null);
+        return found;
+    } catch (_) {
+        return [];
+    }
+}
+
+function udevProperties(path) {
+    try {
+        return runCapture(['udevadm', 'info', '-q', 'property', '-n', path]);
+    } catch (_) {
+        return '';
+    }
+}
+
+function resolveAwakeDevice() {
+    for (const item of listSerialLinks()) {
+        if (item.name.includes(AWAKE_SERIAL))
+            return item.linkPath;
+    }
+    for (const path of ['/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyACM2', '/dev/ttyUSB0', '/dev/ttyUSB1']) {
+        if (!pathExists(path))
+            continue;
+        const info = udevProperties(path);
+        if ((info.includes('ID_VENDOR_ID=1d6b') && info.includes('ID_MODEL_ID=0121')) ||
+            info.includes(`ID_SERIAL_SHORT=${AWAKE_SERIAL}`) || info.includes(AWAKE_SERIAL))
+            return path;
+    }
+    return null;
+}
+
+function resolveSleepingDevice() {
+    for (const item of listSerialLinks()) {
+        if (item.name.includes(SLEEP_SERIAL))
+            return item.linkPath;
+    }
+    for (const path of ['/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyACM2', '/dev/ttyUSB0', '/dev/ttyUSB1']) {
+        if (!pathExists(path))
+            continue;
+        const info = udevProperties(path);
+        if ((info.includes('ID_VENDOR_ID=1a86') && info.includes('ID_MODEL_ID=ca21')) ||
+            info.includes(`ID_SERIAL_SHORT=${SLEEP_SERIAL}`) || info.includes(SLEEP_SERIAL))
+            return path;
+    }
+    return null;
+}
+
+function configureSerial(path) {
+    runCapture([
+        '/usr/bin/stty', '-F', path,
+        String(BAUD), 'raw', '-echo', '-crtscts',
+        'cs8', '-cstopb', '-parenb',
+        'min', '0', 'time', '10',
+    ]);
+}
+
+function wakeIfNeeded() {
+    let awake = resolveAwakeDevice();
+    if (awake)
+        return awake;
+
+    const sleeping = resolveSleepingDevice();
+    if (!sleeping)
+        return null;
+
+    print(`Found sleeping LCD at ${sleeping}; attempting wake-up...`);
+    for (let attempt = 1; attempt <= 10; attempt++) {
+        try {
+            configureSerial(sleeping);
+            const io = Gio.File.new_for_path(sleeping).open_readwrite(null);
+            io.close(null);
+        } catch (_) {
+            // Re-enumeration can invalidate the old tty while it wakes.
+        }
+        GLib.usleep(500_000);
+        awake = resolveAwakeDevice();
+        if (awake) {
+            print(`LCD woke up as ${awake}`);
+            return awake;
+        }
+    }
+    return null;
+}
+
+function resolveDevice(options) {
+    if (options.device)
+        return options.device;
+    let device = resolveAwakeDevice();
+    if (!device && options.wake)
+        device = wakeIfNeeded();
+    return device;
+}
+
+function asciiBytes(text) {
+    const out = new Uint8Array(text.length);
+    for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        if (code > 0x7f)
+            throw new Error(`device paths must be ASCII: ${text}`);
+        out[i] = code;
+    }
+    return out;
+}
+
+function concatBytes(...parts) {
+    const length = parts.reduce((sum, part) => sum + part.length, 0);
+    const out = new Uint8Array(length);
+    let offset = 0;
+    for (const part of parts) {
+        out.set(part, offset);
+        offset += part.length;
+    }
+    return out;
+}
+
+function u32LittleEndian(value) {
+    if (!Number.isSafeInteger(value) || value < 0 || value > 0xffffffff)
+        throw new Error(`file size ${value} does not fit AlphaMonitor's 32-bit upload field`);
+    return Uint8Array.from([
+        value & 0xff,
+        (value >>> 8) & 0xff,
+        (value >>> 16) & 0xff,
+        (value >>> 24) & 0xff,
+    ]);
+}
+
+function u32BigEndian(value) {
+    if (!Number.isSafeInteger(value) || value < 0 || value > 0xffffffff)
+        throw new Error(`value ${value} does not fit a 32-bit field`);
+    return Uint8Array.from([
+        (value >>> 24) & 0xff,
+        (value >>> 16) & 0xff,
+        (value >>> 8) & 0xff,
+        value & 0xff,
+    ]);
+}
+
+function buildPacket(command, declaredLength = 1, payload = null, flag = 0) {
+    const packet = new Uint8Array(PACKET_SIZE);
+    packet[0] = command & 0xff;
+    packet[1] = 0xef;
+    packet[2] = 0x69;
+    packet[3] = (declaredLength >>> 24) & 0xff;
+    packet[4] = (declaredLength >>> 16) & 0xff;
+    packet[5] = (declaredLength >>> 8) & 0xff;
+    packet[6] = declaredLength & 0xff;
+    packet[7] = flag & 0xff;
+    if (payload) {
+        if (payload.length > PACKET_SIZE - 10)
+            throw new Error(`command payload too large (${payload.length} > ${PACKET_SIZE - 10})`);
+        packet.set(payload, 10);
+    }
+    return packet;
+}
+
+function writeAll(output, bytes) {
+    const [ok, written] = output.write_all(bytes, null);
+    if (!ok || written !== bytes.length)
+        throw new Error(`serial write failed (${written}/${bytes.length} bytes)`);
+}
+
+function sendPacket(output, command, declaredLength = 1, payload = null, flag = 0) {
+    writeAll(output, buildPacket(command, declaredLength, payload, flag));
+}
+
+function readSome(input, count = 10240) {
+    const bytes = input.read_bytes(count, null);
+    return bytes.get_data();
+}
+
+function sanitizeReply(bytes) {
+    return new TextDecoder().decode(bytes).replace(/\0/g, '').trim();
+}
+
+function waitForReply(input, attempts, predicate = text => text.length > 0) {
+    let combined = '';
+    for (let i = 0; i < attempts; i++) {
+        const bytes = readSome(input, 10240);
+        if (bytes.length > 0) {
+            combined += sanitizeReply(bytes);
+            if (predicate(combined))
+                return combined;
+        }
+    }
+    return combined;
+}
+
+function hello(input, output) {
+    sendPacket(output, CMD.HELLO, 1, Uint8Array.from([0xc5, 0xd3]));
+    const reply = waitForReply(input, 2, text => text.includes('chs_'));
+    const match = reply.match(/chs_[\x20-\x7e]*/);
+    const ident = match ? match[0] : reply;
+    if (!ident.startsWith('chs_'))
+        throw new Error(`unexpected LCD HELLO reply: ${JSON.stringify(reply)}`);
+    return ident;
+}
+
+function openSerial(options) {
+    const device = resolveDevice(options);
+    if (!device)
+        throw new Error(`LCD serial device not found. Expected awake ${AWAKE_VIDPID}/${AWAKE_SERIAL} or sleeping ${SLEEP_VIDPID}/${SLEEP_SERIAL}.`);
+    if (!pathExists(device))
+        throw new Error(`serial device does not exist: ${device}`);
+    configureSerial(device);
+    const io = Gio.File.new_for_path(device).open_readwrite(null);
+    return {
+        device,
+        io,
+        input: io.get_input_stream(),
+        output: io.get_output_stream(),
+    };
+}
+
+function withSerial(options, callback) {
+    const serial = openSerial(options);
+    try {
+        logVerbose(options, `opened ${serial.device} @ ${BAUD}`);
+        const ident = hello(serial.input, serial.output);
+        logVerbose(options, `HELLO ${ident}`);
+        return callback(serial, ident);
+    } finally {
+        serial.io.close(null);
+    }
+}
+
+function pad250(message, fill = 0x00) {
+    const size = Math.ceil(message.length / PACKET_SIZE) * PACKET_SIZE;
+    if (size === message.length)
+        return message;
+    const out = new Uint8Array(size);
+    out.fill(fill);
+    out.set(message, 0);
+    return out;
+}
+
+function insertChunkSeparators(raw) {
+    const chunks = Math.ceil(raw.length / RAW_CHUNK_SIZE);
+    const out = new Uint8Array(raw.length + Math.max(0, chunks - 1));
+    let srcOffset = 0;
+    let dstOffset = 0;
+    while (srcOffset < raw.length) {
+        const take = Math.min(RAW_CHUNK_SIZE, raw.length - srcOffset);
+        out.set(raw.subarray(srcOffset, srcOffset + take), dstOffset);
+        srcOffset += take;
+        dstOffset += take;
+        if (srcOffset < raw.length)
+            out[dstOffset++] = 0;
+    }
+    return out;
+}
+
+function frameRawBlocks(raw) {
+    if (raw.length === 0)
+        return new Uint8Array(0);
+    const chunks = Math.ceil(raw.length / RAW_CHUNK_SIZE);
+    const out = new Uint8Array(chunks * PACKET_SIZE);
+    for (let chunk = 0; chunk < chunks; chunk++) {
+        const srcOffset = chunk * RAW_CHUNK_SIZE;
+        const take = Math.min(RAW_CHUNK_SIZE, raw.length - srcOffset);
+        out.set(raw.subarray(srcOffset, srcOffset + take), chunk * PACKET_SIZE);
+    }
+    return out;
+}
+
+function writeRawBlocks(output, raw) {
+    const framed = frameRawBlocks(raw);
+    if (framed.length > 0)
+        writeAll(output, framed);
+    return framed.length;
+}
+
+function loadSquareImage(path) {
+    const source = GdkPixbuf.Pixbuf.new_from_file(path);
+    const width = source.get_width();
+    const height = source.get_height();
+    const side = Math.min(width, height);
+    const x = Math.floor((width - side) / 2);
+    const y = Math.floor((height - side) / 2);
+    const square = source.new_subpixbuf(x, y, side, side);
+    return square.scale_simple(WIDTH, HEIGHT, GdkPixbuf.InterpType.BILINEAR);
+}
+
+function applyUserTransformPixbuf(pixbuf, transform) {
+    const normalized = normalizeTransform(transform);
+    let result = pixbuf;
+    if (normalized.rotation === 90)
+        result = result.rotate_simple(GdkPixbuf.PixbufRotation.CLOCKWISE);
+    else if (normalized.rotation === 180)
+        result = result.rotate_simple(GdkPixbuf.PixbufRotation.UPSIDEDOWN);
+    else if (normalized.rotation === 270)
+        result = result.rotate_simple(GdkPixbuf.PixbufRotation.COUNTERCLOCKWISE);
+    if (normalized.mirrorHorizontal)
+        result = result.flip(true);
+    if (normalized.mirrorVertical)
+        result = result.flip(false);
+    return result;
+}
+
+function rotate90CounterClockwiseBGRA(pixbuf) {
+    const width = pixbuf.get_width();
+    const height = pixbuf.get_height();
+    if (width !== WIDTH || height !== HEIGHT)
+        throw new Error(`unexpected resized image size: ${width}x${height}`);
+    const channels = pixbuf.get_n_channels();
+    if (channels !== 3 && channels !== 4)
+        throw new Error(`unsupported pixel channel count: ${channels}`);
+    const rowstride = pixbuf.get_rowstride();
+    const src = pixbuf.get_pixels();
+    const out = new Uint8Array(WIDTH * HEIGHT * 4);
+    let offset = 0;
+    for (let outY = 0; outY < HEIGHT; outY++) {
+        for (let outX = 0; outX < WIDTH; outX++) {
+            const srcX = WIDTH - 1 - outY;
+            const srcY = outX;
+            const i = srcY * rowstride + srcX * channels;
+            out[offset++] = src[i + 2];
+            out[offset++] = src[i + 1];
+            out[offset++] = src[i];
+            out[offset++] = channels === 4 ? src[i + 3] : 0xff;
+        }
+    }
+    return out;
+}
+
+function buildFullFrame(path, transform = {}) {
+    const pixbuf = applyUserTransformPixbuf(loadSquareImage(path), transform);
+    const bgra = rotate90CounterClockwiseBGRA(pixbuf);
+    return pad250(insertChunkSeparators(bgra));
+}
+
+function prepareStoredImage(inputPath, outputPath, transform = {}) {
+    const pixbuf = applyUserTransformPixbuf(loadSquareImage(inputPath), transform);
+    pixbuf.savev(outputPath, 'jpeg', ['quality'], ['95']);
+    if (!pathExists(outputPath))
+        throw new Error(`stored-image renderer did not create ${outputPath}`);
+}
+
+function sendStop(output) {
+    sendPacket(output, CMD.STOP_VIDEO, 1);
+    GLib.usleep(100_000);
+    sendPacket(output, CMD.STOP_MEDIA, 1);
+}
+
+function setBrightness(output, percent) {
+    if (!Number.isInteger(percent) || percent < 0 || percent > 100)
+        throw new Error('brightness must be an integer from 0 to 100');
+    const level = Math.floor(percent / 100 * 255);
+    sendPacket(output, CMD.SET_BRIGHTNESS, 1, Uint8Array.from([level]));
+}
+
+function sendStaticImage(serial, imagePath, brightness, transform = {}) {
+    sendStop(serial.output);
+    setBrightness(serial.output, brightness);
+    // STARTMODE_DEFAULT, null, NO_FLIP, SLEEP_OFF
+    sendPacket(serial.output, CMD.OPTIONS, 5, Uint8Array.from([0x2d, 0x00, 0x00, 0x00, 0x00]));
+
+    const frame = buildFullFrame(imagePath, transform);
+    print(`Prepared ${WIDTH}x${HEIGHT} frame (${frame.length} bytes on wire)`);
+
+    sendPacket(serial.output, CMD.PRE_UPDATE_BITMAP, 1);
+    const start = new Uint8Array(PACKET_SIZE);
+    start.fill(0x2c);
+    writeAll(serial.output, start);
+
+    // Keep the known-good Rev C image packet shape from the real-hardware prototype.
+    const display = Uint8Array.from([0xc8, 0xef, 0x69, 0x00, 0x0e, 0x10, 0x0e, 0x10]);
+    writeAll(serial.output, pad250(display));
+    writeAll(serial.output, frame);
+    GLib.usleep(100_000);
+    readSome(serial.input, 1024);
+    sendPacket(serial.output, CMD.QUERY_STATUS, 1);
+    GLib.usleep(50_000);
+    readSome(serial.input, 1024);
+    serial.output.flush(null);
+}
+
+function fileSize(path) {
+    const info = Gio.File.new_for_path(path).query_info('standard::size', Gio.FileQueryInfoFlags.NONE, null);
+    return Number(info.get_size());
+}
+
+function basenameWithoutExtension(path) {
+    const base = GLib.path_get_basename(path);
+    const dot = base.lastIndexOf('.');
+    return dot > 0 ? base.slice(0, dot) : base;
+}
+
+function safeDeviceStem(path, fallback) {
+    let name = basenameWithoutExtension(path).replace(/[^A-Za-z0-9._-]+/g, '_');
+    name = name.replace(/^_+|_+$/g, '');
+    if (!name)
+        name = fallback;
+    if (name.length > 80)
+        name = name.slice(0, 80);
+    return name;
+}
+
+function safeDeviceFilename(path) {
+    return `${safeDeviceStem(path, 'media')}.mp4`;
+}
+
+function safeDeviceImageFilename(path) {
+    return `${safeDeviceStem(path, 'image')}.jpg`;
+}
+
+function safeStartupDeviceFilename(path) {
+    return `frozr-startup-${safeDeviceStem(path, 'media')}.mp4`;
+}
+
+function safeStartupDeviceImageFilename(path) {
+    return `frozr-startup-${safeDeviceStem(path, 'image')}.jpg`;
+}
+
+function isManagedStartupTarget(path) {
+    if (!path)
+        return false;
+    const inKnownRoot = path.startsWith(DEFAULT_IMAGE_ROOT) || path.startsWith(DEFAULT_VIDEO_ROOT);
+    return inKnownRoot && GLib.path_get_basename(path).startsWith('frozr-startup-');
+}
+
+function cleanupManagedStartupTarget(serial, path, keep = null) {
+    if (!isManagedStartupTarget(path) || path === keep)
+        return;
+    try {
+        deleteRemoteFile(serial, path);
+        print(`Removed previous startup asset ${path}`);
+    } catch (error) {
+        printerr(`warning: could not remove previous startup asset ${path}: ${error.message}`);
+    }
+}
+
+function queryRemoteFileSize(serial, remotePath) {
+    const pathBytes = asciiBytes(remotePath);
+    sendPacket(serial.output, CMD.FILE_SIZE, pathBytes.length, pathBytes, 0);
+    const reply = waitForReply(serial.input, 2, text => /\d/.test(text));
+    const match = reply.match(/-?\d+/);
+    if (!match)
+        throw new Error(`file-size query returned ${JSON.stringify(reply)}`);
+    const value = Number(match[0]);
+    if (!Number.isSafeInteger(value) || value < 0)
+        throw new Error(`invalid remote file size: ${match[0]}`);
+    return value;
+}
+
+function normalizeDeviceDir(path) {
+    if (!path.startsWith('/'))
+        throw new Error(`device directory must be absolute: ${path}`);
+    asciiBytes(path);
+    return path.endsWith('/') ? path : `${path}/`;
+}
+
+function listRemoteDir(serial, remoteDir) {
+    const dir = normalizeDeviceDir(remoteDir);
+    const pathBytes = asciiBytes(dir);
+    sendPacket(serial.output, CMD.LIST_DIR, pathBytes.length, pathBytes, 0);
+    const reply = waitForReply(serial.input, 3, text => text.includes('file:') || text.includes('nodir-createdone'));
+    if (!reply)
+        throw new Error(`directory listing returned no reply for ${dir}`);
+    if (reply.includes('nodir-createdone'))
+        return [];
+    const marker = reply.indexOf('file:');
+    if (marker < 0)
+        throw new Error(`unexpected directory listing reply: ${JSON.stringify(reply)}`);
+    return reply.slice(marker + 5).split('/').map(name => name.trim()).filter(Boolean);
+}
+
+function deleteRemoteFile(serial, remotePath) {
+    const pathBytes = asciiBytes(remotePath);
+    sendPacket(serial.output, CMD.DELETE_FILE, pathBytes.length, pathBytes, 0);
+    GLib.usleep(150_000);
+}
+
+function remoteParent(path) {
+    const slash = path.lastIndexOf('/');
+    if (slash < 0)
+        throw new Error(`invalid device path: ${path}`);
+    return path.slice(0, slash + 1) || '/';
+}
+
+function remoteBasename(path) {
+    const trimmed = path.endsWith('/') ? path.slice(0, -1) : path;
+    return trimmed.slice(trimmed.lastIndexOf('/') + 1);
+}
+
+function queryStorageInfo(serial) {
+    sendPacket(serial.output, CMD.STORAGE_INFO, 1, null, 0);
+    const reply = waitForReply(serial.input, 3, text => text.split('-').length === 6);
+    const fields = reply.split('-');
+    if (fields.length !== 6 || fields.some(value => !/^\d+$/.test(value.trim())))
+        throw new Error(`unexpected storage info reply: ${JSON.stringify(reply)}`);
+    return fields.map(value => Number(value.trim()));
+}
+
+function saveDeviceConfigPacket(output, brightness, startMode, flip, sleepDelay) {
+    const rawBrightness = Math.floor(brightness / 100 * 255);
+    const payload = Uint8Array.from([rawBrightness, startMode, 0, flip ? 1 : 0, sleepDelay]);
+    sendPacket(output, CMD.OPTIONS, 5, payload, 0);
+}
+
+function framedWireSize(size) {
+    return Math.ceil(size / RAW_CHUNK_SIZE) * PACKET_SIZE;
+}
+
+function uploadRawStream(serial, localPath, size) {
+    const input = Gio.File.new_for_path(localPath).read(null);
+    const readBlock = RAW_CHUNK_SIZE * 1024;
+    let sent = 0;
+    let lastPercent = -1;
+    try {
+        while (sent < size) {
+            const bytes = input.read_bytes(Math.min(readBlock, size - sent), null).get_data();
+            if (bytes.length === 0)
+                break;
+            const chunks = Math.ceil(bytes.length / RAW_CHUNK_SIZE);
+            const framed = new Uint8Array(chunks * PACKET_SIZE);
+            for (let chunk = 0; chunk < chunks; chunk++) {
+                const srcOffset = chunk * RAW_CHUNK_SIZE;
+                const take = Math.min(RAW_CHUNK_SIZE, bytes.length - srcOffset);
+                framed.set(bytes.subarray(srcOffset, srcOffset + take), chunk * PACKET_SIZE);
+            }
+            writeAll(serial.output, framed);
+            sent += bytes.length;
+            const percent = Math.floor(sent / size * 100);
+            if (percent >= lastPercent + 5 || percent === 100) {
+                print(`Upload ${percent}% (${sent}/${size} bytes)`);
+                lastPercent = percent;
+            }
+        }
+    } finally {
+        input.close(null);
+    }
+    if (sent !== size)
+        throw new Error(`local read ended early (${sent}/${size} bytes)`);
+}
+
+function createRemoteFile(serial, remotePath, size) {
+    const pathBytes = asciiBytes(remotePath);
+    const payload = concatBytes(pathBytes, u32LittleEndian(size));
+    // AlphaMonitor declares only the path length in the header while still appending 4 LE size bytes.
+    sendPacket(serial.output, CMD.FILE_UPLOAD, pathBytes.length, payload, 0);
+    const reply = waitForReply(serial.input, 3, text => text.includes('create_success'));
+    if (!reply.includes('create_success'))
+        throw new Error(`remote create failed: ${JSON.stringify(reply)}`);
+    return reply;
+}
+
+function playRemoteVideo(serial, remotePath, background) {
+    const pathBytes = asciiBytes(remotePath);
+    sendPacket(serial.output, CMD.PLAY_VIDEO, pathBytes.length, pathBytes, background ? 1 : 0);
+    const reply = waitForReply(serial.input, 6, text => text.includes('play_video_success'));
+    if (!reply.includes('play_video_success'))
+        throw new Error(`play failed: ${JSON.stringify(reply)}`);
+    return reply;
+}
+
+function playRemoteImage(serial, remotePath) {
+    const pathBytes = asciiBytes(remotePath);
+    sendPacket(serial.output, CMD.PLAY_IMAGE, pathBytes.length, pathBytes, 0);
+    const reply = waitForReply(serial.input, 6, text => text.includes('play_img_ok'));
+    if (!reply.includes('play_img_ok'))
+        throw new Error(`image playback failed: ${JSON.stringify(reply)}`);
+    return reply;
+}
+
+function uploadAndVerify(serial, localPath, remotePath) {
+    const size = fileSize(localPath);
+    if (size > 0xffffffff)
+        throw new Error('AlphaMonitor upload format is limited to a 32-bit file length (4 GiB max)');
+    print(`Creating ${remotePath} (${size} bytes)...`);
+    createRemoteFile(serial, remotePath, size);
+    print(`Transferring ${size} bytes (${framedWireSize(size)} bytes on serial wire)...`);
+    uploadRawStream(serial, localPath, size);
+    const remoteSize = queryRemoteFileSize(serial, remotePath);
+    if (remoteSize !== size)
+        throw new Error(`upload verification failed: local=${size}, remote=${remoteSize}`);
+    print(`Verified remote size: ${remoteSize} bytes`);
+    return remoteSize;
+}
+
+function uploadAndPlay(serial, localPath, remotePath, background, shouldPlay) {
+    uploadAndVerify(serial, localPath, remotePath);
+    if (shouldPlay) {
+        print(`Playing ${remotePath}${background ? ' (background flag=1)' : ''}...`);
+        playRemoteVideo(serial, remotePath, background);
+        print('Playback started.');
+    }
+}
+
+function panelFilterForTransform(transform = {}) {
+    const normalized = normalizeTransform(transform);
+    const filters = [`scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase`, `crop=${WIDTH}:${HEIGHT}`];
+    if (normalized.rotation === 90)
+        filters.push('transpose=1');
+    else if (normalized.rotation === 180)
+        filters.push('transpose=1', 'transpose=1');
+    else if (normalized.rotation === 270)
+        filters.push('transpose=2');
+    if (normalized.mirrorHorizontal)
+        filters.push('hflip');
+    if (normalized.mirrorVertical)
+        filters.push('vflip');
+    filters.push('setsar=1:1');
+    return filters.join(',');
+}
+
+function transcodeForPanel(inputPath, outputPath, options, transform = {}) {
+    const ffmpeg = findFfmpeg();
+    if (!ffmpeg)
+        throw new Error('ffmpeg is required for GIF/video transcoding. Ubuntu/Debian: sudo apt install ffmpeg. Or pass --direct for an already compatible MP4.');
+    const filter = panelFilterForTransform(transform);
+    const argv = [
+        ffmpeg, '-hide_banner', '-loglevel', options.verbose ? 'info' : 'error', '-y',
+        '-i', inputPath,
+        '-vf', filter,
+        '-c:v', 'libx264', '-b:v', '2400k', '-bufsize', '2400k',
+        '-r', '24', '-an', '-pix_fmt', 'yuv420p', '-f', 'mp4', outputPath,
+    ];
+    logVerbose(options, argv.join(' '));
+    const proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+    const [, , stderr] = proc.communicate_utf8(null, null);
+    if (!proc.get_successful())
+        throw new Error(`ffmpeg failed: ${(stderr || '').trim()}`);
+}
+
+function parseBrightnessCommand(args) {
+    if (args.length !== 1)
+        die('brightness requires exactly one value');
+    const value = Number(args[0]);
+    if (!Number.isInteger(value) || value < 0 || value > 100)
+        die('brightness must be an integer from 0 to 100');
+    return value;
+}
+
+function parseImageCommand(args) {
+    const config = loadConfig();
+    const result = {
+        file: null,
+        brightness: Number.isInteger(config.brightness) ? config.brightness : 25,
+        ...transformFromConfig(config),
+    };
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--brightness') {
+            if (++i >= args.length)
+                die('--brightness requires a value');
+            result.brightness = Number(args[i]);
+            if (!Number.isInteger(result.brightness) || result.brightness < 0 || result.brightness > 100)
+                die('--brightness must be an integer from 0 to 100');
+        } else if (arg === '--rotation') {
+            if (++i >= args.length)
+                die('--rotation requires 0, 90, 180, or 270');
+            result.rotation = normalizeRotation(args[i], '--rotation');
+        } else if (arg === '--mirror-horizontal') {
+            if (++i >= args.length)
+                die('--mirror-horizontal requires on or off');
+            result.mirrorHorizontal = parseOnOff(args[i], '--mirror-horizontal');
+        } else if (arg === '--mirror-vertical') {
+            if (++i >= args.length)
+                die('--mirror-vertical requires on or off');
+            result.mirrorVertical = parseOnOff(args[i], '--mirror-vertical');
+        } else if (arg.startsWith('-')) {
+            die(`unknown image option: ${arg}`);
+        } else if (result.file === null) {
+            result.file = canonicalPath(arg);
+        } else {
+            die(`unexpected image argument: ${arg}`);
+        }
+    }
+    if (!result.file)
+        die('image requires a file');
+    return result;
+}
+
+function parsePreviewCommand(args) {
+    const config = loadConfig();
+    const result = {
+        file: null,
+        output: null,
+        ...transformFromConfig(config),
+    };
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--rotation') {
+            if (++i >= args.length)
+                die('--rotation requires 0, 90, 180, or 270');
+            result.rotation = normalizeRotation(args[i], '--rotation');
+        } else if (arg === '--mirror-horizontal') {
+            if (++i >= args.length)
+                die('--mirror-horizontal requires on or off');
+            result.mirrorHorizontal = parseOnOff(args[i], '--mirror-horizontal');
+        } else if (arg === '--mirror-vertical') {
+            if (++i >= args.length)
+                die('--mirror-vertical requires on or off');
+            result.mirrorVertical = parseOnOff(args[i], '--mirror-vertical');
+        } else if (arg.startsWith('-')) {
+            die(`unknown preview option: ${arg}`);
+        } else if (result.file === null) {
+            result.file = canonicalPath(arg);
+        } else if (result.output === null) {
+            result.output = canonicalPath(arg);
+        } else {
+            die(`unexpected preview argument: ${arg}`);
+        }
+    }
+    if (!result.file || !result.output)
+        die('preview requires an input file and output PNG path');
+    return result;
+}
+
+function parseMediaCommand(args) {
+    const config = loadConfig();
+    const result = {
+        file: null,
+        target: null,
+        background: false,
+        play: true,
+        direct: false,
+        brightness: Number.isInteger(config.brightness) ? config.brightness : 25,
+        ...transformFromConfig(config),
+    };
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--target') {
+            if (++i >= args.length)
+                die('--target requires a device path');
+            result.target = args[i];
+        } else if (arg === '--background') {
+            result.background = true;
+        } else if (arg === '--no-play') {
+            result.play = false;
+        } else if (arg === '--direct') {
+            result.direct = true;
+        } else if (arg === '--brightness') {
+            if (++i >= args.length)
+                die('--brightness requires a value');
+            result.brightness = Number(args[i]);
+            if (!Number.isInteger(result.brightness) || result.brightness < 0 || result.brightness > 100)
+                die('--brightness must be 0..100');
+        } else if (arg === '--rotation') {
+            if (++i >= args.length)
+                die('--rotation requires 0, 90, 180, or 270');
+            result.rotation = normalizeRotation(args[i], '--rotation');
+        } else if (arg === '--mirror-horizontal') {
+            if (++i >= args.length)
+                die('--mirror-horizontal requires on or off');
+            result.mirrorHorizontal = parseOnOff(args[i], '--mirror-horizontal');
+        } else if (arg === '--mirror-vertical') {
+            if (++i >= args.length)
+                die('--mirror-vertical requires on or off');
+            result.mirrorVertical = parseOnOff(args[i], '--mirror-vertical');
+        } else if (arg.startsWith('-')) {
+            die(`unknown media option: ${arg}`);
+        } else if (result.file === null) {
+            result.file = canonicalPath(arg);
+        } else {
+            die(`unexpected media argument: ${arg}`);
+        }
+    }
+    if (!result.file)
+        die('media requires a file');
+    if (!result.target)
+        result.target = `${DEFAULT_VIDEO_ROOT}${safeDeviceFilename(result.file)}`;
+    if (!result.target.startsWith('/'))
+        die('--target must be an absolute device filesystem path');
+    asciiBytes(result.target);
+    if (result.target.length > 230)
+        die('--target is too long for the 250-byte command packet');
+    return result;
+}
+
+function parseDeviceStartCommand(args) {
+    const config = loadConfig();
+    const result = {
+        mode: null,
+        file: null,
+        direct: false,
+        brightness: Number.isInteger(config.brightness) ? config.brightness : 25,
+        ...startupTransformFromConfig(config),
+    };
+    if (args.length === 0)
+        die('device-start requires default, image, or media');
+    result.mode = args[0];
+    if (!['default', 'image', 'media'].includes(result.mode))
+        die('device-start mode must be default, image, or media');
+
+    for (let i = 1; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--brightness') {
+            if (++i >= args.length)
+                die('--brightness requires a value');
+            result.brightness = Number(args[i]);
+            if (!Number.isInteger(result.brightness) || result.brightness < 0 || result.brightness > 100)
+                die('--brightness must be 0..100');
+        } else if (arg === '--rotation') {
+            if (++i >= args.length)
+                die('--rotation requires 0, 90, 180, or 270');
+            result.rotation = normalizeRotation(args[i], '--rotation');
+        } else if (arg === '--mirror-horizontal') {
+            if (++i >= args.length)
+                die('--mirror-horizontal requires on or off');
+            result.mirrorHorizontal = parseOnOff(args[i], '--mirror-horizontal');
+        } else if (arg === '--mirror-vertical') {
+            if (++i >= args.length)
+                die('--mirror-vertical requires on or off');
+            result.mirrorVertical = parseOnOff(args[i], '--mirror-vertical');
+        } else if (arg === '--direct') {
+            result.direct = true;
+        } else if (arg.startsWith('-')) {
+            die(`unknown device-start option: ${arg}`);
+        } else if (result.file === null) {
+            result.file = canonicalPath(arg);
+        } else {
+            die(`unexpected device-start argument: ${arg}`);
+        }
+    }
+
+    if (result.mode === 'default') {
+        if (result.file)
+            die('device-start default does not take a file');
+        if (result.direct)
+            die('--direct is only valid with device-start media');
+    } else if (!result.file) {
+        die(`device-start ${result.mode} requires a file`);
+    }
+    if (result.mode !== 'media' && result.direct)
+        die('--direct is only valid with device-start media');
+    if (result.direct && !result.file.toLowerCase().endsWith('.mp4'))
+        die('--direct currently accepts MP4 only');
+    if (result.direct && (result.rotation !== 0 || result.mirrorHorizontal || result.mirrorVertical))
+        die('--direct cannot apply rotation/mirroring; remove --direct to transform startup media');
+    return result;
+}
+
+function parseDashboardCommand(args) {
+    const config = loadConfig();
+    const result = {
+        brightness: Number.isInteger(config.brightness) ? config.brightness : 25,
+        interval: 1000,
+        frames: 0,
+        quiet: false,
+        ...transformFromConfig(config),
+    };
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--brightness') {
+            if (++i >= args.length)
+                die('--brightness requires a value');
+            result.brightness = Number(args[i]);
+            if (!Number.isInteger(result.brightness) || result.brightness < 0 || result.brightness > 100)
+                die('--brightness must be 0..100');
+        } else if (arg === '--interval') {
+            if (++i >= args.length)
+                die('--interval requires milliseconds');
+            result.interval = Number(args[i]);
+            if (!Number.isInteger(result.interval) || result.interval < 250 || result.interval > 10000)
+                die('--interval must be an integer from 250 to 10000');
+        } else if (arg === '--frames') {
+            if (++i >= args.length)
+                die('--frames requires a value');
+            result.frames = Number(args[i]);
+            if (!Number.isInteger(result.frames) || result.frames < 0)
+                die('--frames must be a non-negative integer');
+        } else if (arg === '--quiet') {
+            result.quiet = true;
+        } else if (arg === '--rotation') {
+            if (++i >= args.length)
+                die('--rotation requires 0, 90, 180, or 270');
+            result.rotation = normalizeRotation(args[i], '--rotation');
+        } else if (arg === '--mirror-horizontal') {
+            if (++i >= args.length)
+                die('--mirror-horizontal requires on or off');
+            result.mirrorHorizontal = parseOnOff(args[i], '--mirror-horizontal');
+        } else if (arg === '--mirror-vertical') {
+            if (++i >= args.length)
+                die('--mirror-vertical requires on or off');
+            result.mirrorVertical = parseOnOff(args[i], '--mirror-vertical');
+        } else {
+            die(`unknown dashboard option: ${arg}`);
+        }
+    }
+    return result;
+}
+
+function readTextFile(path) {
+    try {
+        const [, bytes] = GLib.file_get_contents(path);
+        return new TextDecoder().decode(bytes).trim();
+    } catch (_) {
+        return null;
+    }
+}
+
+function readCpuTimes() {
+    const text = readTextFile('/proc/stat');
+    if (!text)
+        return null;
+    const line = text.split('\n').find(value => value.startsWith('cpu '));
+    if (!line)
+        return null;
+    const values = line.trim().split(/\s+/).slice(1).map(Number);
+    if (values.length < 4 || values.some(value => !Number.isFinite(value)))
+        return null;
+    const idle = values[3] + (values[4] || 0);
+    const total = values.reduce((sum, value) => sum + value, 0);
+    return {idle, total};
+}
+
+function cpuUsage(state) {
+    const current = readCpuTimes();
+    if (!current)
+        return null;
+    const previous = state.cpuTimes;
+    state.cpuTimes = current;
+    if (!previous)
+        return 0;
+    const totalDelta = current.total - previous.total;
+    const idleDelta = current.idle - previous.idle;
+    if (totalDelta <= 0)
+        return 0;
+    return Math.max(0, Math.min(100, (totalDelta - idleDelta) / totalDelta * 100));
+}
+
+function memoryUsage() {
+    const text = readTextFile('/proc/meminfo');
+    if (!text)
+        return null;
+    const values = {};
+    for (const line of text.split('\n')) {
+        const match = line.match(/^(\w+):\s+(\d+)/);
+        if (match)
+            values[match[1]] = Number(match[2]);
+    }
+    const total = values.MemTotal;
+    const available = values.MemAvailable ?? values.MemFree;
+    if (!total || available === undefined)
+        return null;
+    return {
+        percent: Math.max(0, Math.min(100, (total - available) / total * 100)),
+        usedGiB: (total - available) / 1024 / 1024,
+        totalGiB: total / 1024 / 1024,
+    };
+}
+
+function enumerateNames(path) {
+    try {
+        const dir = Gio.File.new_for_path(path);
+        const enumerator = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+        const names = [];
+        while (true) {
+            const info = enumerator.next_file(null);
+            if (info === null)
+                break;
+            names.push(info.get_name());
+        }
+        enumerator.close(null);
+        return names;
+    } catch (_) {
+        return [];
+    }
+}
+
+function hwmonTemperature(preferredNames) {
+    let best = null;
+    for (const hwmon of enumerateNames('/sys/class/hwmon').filter(name => name.startsWith('hwmon'))) {
+        const root = `/sys/class/hwmon/${hwmon}`;
+        const driver = readTextFile(`${root}/name`) || '';
+        if (!preferredNames.some(name => driver.toLowerCase().includes(name)))
+            continue;
+        for (const entry of enumerateNames(root)) {
+            if (!/^temp\d+_input$/.test(entry))
+                continue;
+            const raw = Number(readTextFile(`${root}/${entry}`));
+            const value = raw / 1000;
+            if (Number.isFinite(value) && value > 0 && value < 130)
+                best = best === null ? value : Math.max(best, value);
+        }
+    }
+    return best;
+}
+
+function amdGpuUsage() {
+    for (const card of enumerateNames('/sys/class/drm').filter(name => /^card\d+$/.test(name))) {
+        const raw = Number(readTextFile(`/sys/class/drm/${card}/device/gpu_busy_percent`));
+        if (Number.isFinite(raw) && raw >= 0 && raw <= 100)
+            return raw;
+    }
+    return null;
+}
+
+function nvidiaStats() {
+    const nvidiaSmi = GLib.find_program_in_path('nvidia-smi');
+    if (!nvidiaSmi)
+        return null;
+    try {
+        const text = runCapture([
+            nvidiaSmi,
+            '--query-gpu=utilization.gpu,temperature.gpu',
+            '--format=csv,noheader,nounits',
+        ]).trim().split('\n')[0];
+        const [usageText, tempText] = text.split(',').map(value => value.trim());
+        const usage = Number(usageText);
+        const temp = Number(tempText);
+        return {
+            usage: Number.isFinite(usage) ? usage : null,
+            temp: Number.isFinite(temp) ? temp : null,
+            label: 'NVIDIA',
+        };
+    } catch (_) {
+        return null;
+    }
+}
+
+function collectDashboardStats(state) {
+    const memory = memoryUsage();
+    const nvidia = nvidiaStats();
+    const gpuUsage = nvidia?.usage ?? amdGpuUsage();
+    const gpuTemp = nvidia?.temp ?? hwmonTemperature(['amdgpu']);
+    return {
+        cpu: cpuUsage(state),
+        cpuTemp: hwmonTemperature(['coretemp', 'k10temp', 'zenpower', 'cpu_thermal']),
+        ram: memory?.percent ?? null,
+        ramText: memory ? `${memory.usedGiB.toFixed(1)} / ${memory.totalGiB.toFixed(1)} GiB` : 'N/A',
+        gpu: gpuUsage,
+        gpuTemp,
+        gpuLabel: nvidia?.label ?? (gpuUsage !== null ? 'GPU' : 'GPU'),
+        now: GLib.DateTime.new_now_local(),
+    };
+}
+
+function formatPercent(value) {
+    return value === null ? 'N/A' : `${Math.round(value)}%`;
+}
+
+function formatTemp(value) {
+    return value === null ? 'N/A' : `${Math.round(value)}°C`;
+}
+
+function setCairoSourceHex(cr, hex) {
+    const value = Number.parseInt(hex.replace('#', ''), 16);
+    cr.setSourceRGB(((value >> 16) & 0xff) / 255, ((value >> 8) & 0xff) / 255, (value & 0xff) / 255);
+}
+
+function drawDashboardText(cr, text, x, y, size, weight = Pango.Weight.NORMAL, color = '#f4f7fb') {
+    const layout = PangoCairo.create_layout(cr);
+    const description = Pango.FontDescription.from_string(`Sans ${size}`);
+    description.set_weight(weight);
+    layout.set_font_description(description);
+    layout.set_text(text, -1);
+    setCairoSourceHex(cr, color);
+    cr.moveTo(x, y);
+    PangoCairo.show_layout(cr, layout);
+}
+
+function drawMetric(cr, label, value, detail, x, y, width, fraction) {
+    drawDashboardText(cr, label, x, y, 13, Pango.Weight.BOLD, '#9eb3c7');
+    drawDashboardText(cr, value, x, y + 25, 26, Pango.Weight.BOLD, '#f4f7fb');
+    if (detail)
+        drawDashboardText(cr, detail, x + 82, y + 35, 10, Pango.Weight.NORMAL, '#8799aa');
+    setCairoSourceHex(cr, '#1d2b38');
+    cr.rectangle(x, y + 68, width, 7);
+    cr.fill();
+    setCairoSourceHex(cr, '#59d6c4');
+    cr.rectangle(x, y + 68, width * Math.max(0, Math.min(1, fraction || 0)), 7);
+    cr.fill();
+}
+
+function renderDashboardPng(path, stats) {
+    const surface = new Cairo.ImageSurface(Cairo.Format.ARGB32, WIDTH, HEIGHT);
+    const cr = new Cairo.Context(surface);
+    setCairoSourceHex(cr, '#0a1118');
+    cr.paint();
+
+    setCairoSourceHex(cr, '#14222e');
+    cr.arc(WIDTH / 2, HEIGHT / 2, 225, 0, Math.PI * 2);
+    cr.fill();
+    setCairoSourceHex(cr, '#0a1118');
+    cr.arc(WIDTH / 2, HEIGHT / 2, 214, 0, Math.PI * 2);
+    cr.fill();
+
+    drawDashboardText(cr, 'FROZR // LIVE', 48, 40, 12, Pango.Weight.BOLD, '#59d6c4');
+    const timeText = stats.now.format('%H:%M:%S');
+    drawDashboardText(cr, timeText, 48, 68, 34, Pango.Weight.BOLD, '#f4f7fb');
+    drawDashboardText(cr, stats.now.format('%Y-%m-%d'), 304, 84, 11, Pango.Weight.NORMAL, '#8799aa');
+
+    drawMetric(cr, 'CPU', formatPercent(stats.cpu), formatTemp(stats.cpuTemp), 48, 132, 170, (stats.cpu ?? 0) / 100);
+    drawMetric(cr, stats.gpuLabel, formatPercent(stats.gpu), formatTemp(stats.gpuTemp), 262, 132, 170, (stats.gpu ?? 0) / 100);
+    drawMetric(cr, 'RAM', formatPercent(stats.ram), stats.ramText, 48, 246, 384, (stats.ram ?? 0) / 100);
+
+    setCairoSourceHex(cr, '#203443');
+    cr.setLineWidth(1);
+    cr.moveTo(48, 354);
+    cr.lineTo(432, 354);
+    cr.stroke();
+    drawDashboardText(cr, `CPU ${formatTemp(stats.cpuTemp)}`, 48, 374, 12, Pango.Weight.BOLD, '#9eb3c7');
+    drawDashboardText(cr, `GPU ${formatTemp(stats.gpuTemp)}`, 184, 374, 12, Pango.Weight.BOLD, '#9eb3c7');
+    drawDashboardText(cr, 'Linux · Rev C', 318, 374, 12, Pango.Weight.BOLD, '#59d6c4');
+    drawDashboardText(cr, 'XIGMATEK FROZR-O II', 48, 421, 11, Pango.Weight.NORMAL, '#647b8f');
+
+    surface.flush();
+    surface.writeToPNG(path);
+    surface.finish();
+}
+
+function renderDashboardFrame(stats, transform = {}) {
+    const path = GLib.build_filenamev([GLib.get_tmp_dir(), `frozr-dashboard-${GLib.get_monotonic_time()}.png`]);
+    try {
+        renderDashboardPng(path, stats);
+        const pixbuf = applyUserTransformPixbuf(GdkPixbuf.Pixbuf.new_from_file(path), transform);
+        return rotate90CounterClockwiseBGRA(pixbuf);
+    } finally {
+        if (pathExists(path)) {
+            try {
+                Gio.File.new_for_path(path).delete(null);
+            } catch (_) {
+                // Best-effort cleanup.
+            }
+        }
+    }
+}
+
+function pixelsEqual(a, b, index) {
+    const offset = index * 4;
+    return a[offset] === b[offset] && a[offset + 1] === b[offset + 1] &&
+        a[offset + 2] === b[offset + 2] && a[offset + 3] === b[offset + 3];
+}
+
+function encodeDeltaFrame(previous, current, maxRun = 65000) {
+    if (previous.length !== current.length || current.length % 4 !== 0)
+        throw new Error('delta frames must have equal 4-byte-pixel lengths');
+    const pixelCount = current.length / 4;
+    const output = new Uint8Array(current.length);
+    let out = 0;
+    let changedPixels = 0;
+    let runs = 0;
+
+    const ensure = count => {
+        if (out + count > output.length)
+            return false;
+        return true;
+    };
+
+    let pixel = 0;
+    while (pixel < pixelCount) {
+        if (pixelsEqual(previous, current, pixel)) {
+            pixel++;
+            continue;
+        }
+        const start = pixel;
+        while (pixel < pixelCount && !pixelsEqual(previous, current, pixel)) {
+            pixel++;
+            if (pixel - start > maxRun)
+                return null;
+        }
+        const runLength = pixel - start;
+        changedPixels += runLength;
+        runs++;
+
+        if (runLength === 1) {
+            if (!ensure(7))
+                return null;
+            output[out++] = ((start >> 16) & 0x7f) | 0x80;
+            output[out++] = (start >> 8) & 0xff;
+            output[out++] = start & 0xff;
+            const source = start * 4;
+            output[out++] = current[source];
+            output[out++] = current[source + 1];
+            output[out++] = current[source + 2];
+            output[out++] = current[source + 3];
+            continue;
+        }
+
+        const needed = 5 + runLength * 4;
+        if (!ensure(needed))
+            return null;
+        output[out++] = (start >> 16) & 0x7f;
+        output[out++] = (start >> 8) & 0xff;
+        output[out++] = start & 0xff;
+        output[out++] = (runLength >> 8) & 0xff;
+        output[out++] = runLength & 0xff;
+        const sourceStart = start * 4;
+        output.set(current.subarray(sourceStart, sourceStart + runLength * 4), out);
+        out += runLength * 4;
+    }
+
+    return {
+        bytes: output.subarray(0, out),
+        changedPixels,
+        runs,
+    };
+}
+
+function queryRenderStatus(serial) {
+    sendPacket(serial.output, CMD.QUERY_STATUS, 1);
+    const reply = waitForReply(serial.input, 2, text => text.includes('renderCnt:') || text.includes('needReSend:1'));
+    const countMatch = reply.match(/renderCnt:(\d+)/);
+    return {
+        raw: reply,
+        renderCount: countMatch ? Number(countMatch[1]) : null,
+        needResend: reply.includes('needReSend:1'),
+    };
+}
+
+function sendLiveFullFrame(serial, frame, brightness) {
+    if (frame.length !== WIDTH * HEIGHT * 4)
+        throw new Error(`live full frame must be ${WIDTH * HEIGHT * 4} bytes`);
+    const status = queryRenderStatus(serial);
+    const start = new Uint8Array(PACKET_SIZE);
+    start.fill(0x2c);
+    writeAll(serial.output, start);
+    GLib.usleep(10_000);
+    setBrightness(serial.output, brightness);
+    GLib.usleep(10_000);
+    sendPacket(serial.output, CMD.DISPLAY_BITMAP_2INCH, frame.length, null, 0);
+    GLib.usleep(500_000);
+    const wireBytes = writeRawBlocks(serial.output, frame);
+    GLib.usleep(10_000);
+    const reply = sanitizeReply(readSome(serial.input, 1024));
+    return {status, wireBytes, reply};
+}
+
+function sendLiveDelta(serial, previous, current, frameIndex) {
+    const delta = encodeDeltaFrame(previous, current);
+    if (delta === null)
+        return null;
+    if (delta.bytes.length === 0)
+        return {wireBytes: 0, payloadBytes: 0, changedPixels: 0, runs: 0};
+    const payload = concatBytes(delta.bytes, Uint8Array.from([0xef, 0x69]));
+    const metadata = new Uint8Array(8);
+    metadata.set(u32BigEndian(frameIndex), 0);
+    sendPacket(serial.output, CMD.DELTA_BITMAP, payload.length, metadata, 0);
+    const wireBytes = writeRawBlocks(serial.output, payload);
+    return {
+        wireBytes,
+        payloadBytes: payload.length,
+        changedPixels: delta.changedPixels,
+        runs: delta.runs,
+    };
+}
+
+function runDashboard(options, parsed, remember = true) {
+    const sensorState = {cpuTimes: null};
+    // Prime CPU accounting before the first visible frame.
+    cpuUsage(sensorState);
+    if (options.dryRun) {
+        GLib.usleep(50_000);
+        const first = renderDashboardFrame(collectDashboardStats(sensorState), parsed);
+        GLib.usleep(50_000);
+        const second = renderDashboardFrame(collectDashboardStats(sensorState), parsed);
+        const delta = encodeDeltaFrame(first, second);
+        print(JSON.stringify({
+            command: 'dashboard',
+            brightness: parsed.brightness,
+            intervalMs: parsed.interval,
+            frames: parsed.frames,
+            rotation: parsed.rotation,
+            mirrorHorizontal: parsed.mirrorHorizontal,
+            mirrorVertical: parsed.mirrorVertical,
+            fullFrameBytes: first.length,
+            fullFrameWireBytes: frameRawBlocks(first).length,
+            deltaBytes: delta?.bytes.length ?? null,
+            deltaRuns: delta?.runs ?? null,
+            deltaChangedPixels: delta?.changedPixels ?? null,
+            protocol: {full: '0xc8', delta: '0xcc', status: '0xcf'},
+        }, null, 2));
+        return;
+    }
+
+    withSerial(options, serial => {
+        sendStop(serial.output);
+        GLib.usleep(50_000);
+        const firstStats = collectDashboardStats(sensorState);
+        let previous = renderDashboardFrame(firstStats, parsed);
+        const initialized = sendLiveFullFrame(serial, previous, parsed.brightness);
+        if (!parsed.quiet) {
+            print(`Dashboard initialized: ${initialized.wireBytes} bytes on wire`);
+            if (initialized.status.raw)
+                print(`Render status: ${initialized.status.raw}`);
+        }
+        if (remember) {
+            saveTransform(parsed);
+            rememberAction({
+                type: 'dashboard',
+                brightness: parsed.brightness,
+                interval: parsed.interval,
+                rotation: parsed.rotation,
+                mirrorHorizontal: parsed.mirrorHorizontal,
+                mirrorVertical: parsed.mirrorVertical,
+            });
+        }
+
+        let produced = 1;
+        let frameIndex = 1;
+        while (parsed.frames === 0 || produced < parsed.frames) {
+            GLib.usleep(parsed.interval * 1000);
+            const stats = collectDashboardStats(sensorState);
+            const current = renderDashboardFrame(stats, parsed);
+            let result = sendLiveDelta(serial, previous, current, frameIndex);
+            if (result === null) {
+                if (!parsed.quiet)
+                    print(`Frame ${frameIndex}: delta too large; resending full frame`);
+                sendLiveFullFrame(serial, current, parsed.brightness);
+                result = {wireBytes: frameRawBlocks(current).length, payloadBytes: current.length, changedPixels: WIDTH * HEIGHT, runs: 1};
+            } else if (!parsed.quiet) {
+                print(`Frame ${frameIndex}: changed=${result.changedPixels} runs=${result.runs} payload=${result.payloadBytes} wire=${result.wireBytes}`);
+            }
+            previous = current;
+            frameIndex = (frameIndex + 1) >>> 0;
+            produced++;
+        }
+    });
+}
+
+function commandDashboard(options) {
+    const parsed = parseDashboardCommand(options.args);
+    runDashboard(options, parsed, true);
+}
+
+function commandStatus(options) {
+    if (options.args.length !== 0)
+        die('status takes no arguments');
+    if (options.dryRun) {
+        print(JSON.stringify({
+            awakeVidPid: AWAKE_VIDPID,
+            awakeSerial: AWAKE_SERIAL,
+            sleepingVidPid: SLEEP_VIDPID,
+            sleepingSerial: SLEEP_SERIAL,
+            baud: BAUD,
+        }, null, 2));
+        return;
+    }
+    withSerial(options, (serial, ident) => {
+        print(`Device: ${serial.device}`);
+        print(`HELLO: ${ident}`);
+        print(`Baud: ${BAUD}`);
+    });
+}
+
+function commandBrightness(options) {
+    const value = parseBrightnessCommand(options.args);
+    if (options.dryRun) {
+        print(JSON.stringify({command: 'brightness', percent: value, raw: Math.floor(value / 100 * 255)}, null, 2));
+        return;
+    }
+    withSerial(options, serial => {
+        setBrightness(serial.output, value);
+        serial.output.flush(null);
+        print(`Brightness set to ${value}%`);
+    });
+    const config = loadConfig();
+    config.brightness = value;
+    saveConfig(config);
+}
+
+function commandStop(options) {
+    if (options.args.length !== 0)
+        die('stop takes no arguments');
+    if (options.dryRun) {
+        print('Would send STOP_VIDEO (0x79), wait 100 ms, then STOP_MEDIA (0x96).');
+        return;
+    }
+    withSerial(options, serial => {
+        sendStop(serial.output);
+        serial.output.flush(null);
+        print('Playback stopped.');
+    });
+    rememberAction({type: 'stopped'});
+}
+
+function commandImage(options) {
+    const parsed = parseImageCommand(options.args);
+    if (!pathExists(parsed.file))
+        die(`image does not exist: ${parsed.file}`);
+    const frame = buildFullFrame(parsed.file, parsed);
+    if (options.dryRun) {
+        print(JSON.stringify({
+            command: 'image',
+            file: parsed.file,
+            width: WIDTH,
+            height: HEIGHT,
+            frameBytesOnWire: frame.length,
+            brightness: parsed.brightness,
+            rotation: parsed.rotation,
+            mirrorHorizontal: parsed.mirrorHorizontal,
+            mirrorVertical: parsed.mirrorVertical,
+        }, null, 2));
+        return;
+    }
+    withSerial(options, serial => {
+        sendStaticImage(serial, parsed.file, parsed.brightness, parsed);
+        print('Image transfer finished.');
+    });
+    saveTransform(parsed);
+    rememberAction({
+        type: 'image',
+        source: parsed.file,
+        brightness: parsed.brightness,
+        rotation: parsed.rotation,
+        mirrorHorizontal: parsed.mirrorHorizontal,
+        mirrorVertical: parsed.mirrorVertical,
+    });
+}
+
+function commandFileSize(options) {
+    if (options.args.length !== 1)
+        die('file-size requires exactly one device path');
+    const remotePath = options.args[0];
+    asciiBytes(remotePath);
+    if (options.dryRun) {
+        print(JSON.stringify({command: 'file-size', opcode: '0x6e', path: remotePath}, null, 2));
+        return;
+    }
+    withSerial(options, serial => {
+        print(String(queryRemoteFileSize(serial, remotePath)));
+    });
+}
+
+function commandList(options) {
+    if (options.args.length > 1)
+        die('ls accepts at most one device directory');
+    const dir = options.args[0] || DEFAULT_VIDEO_ROOT;
+    if (options.dryRun) {
+        print(JSON.stringify({command: 'ls', opcode: '0x65', directory: normalizeDeviceDir(dir)}, null, 2));
+        return;
+    }
+    withSerial(options, serial => {
+        const files = listRemoteDir(serial, dir);
+        for (const file of files)
+            print(file);
+    });
+}
+
+function commandRemove(options) {
+    if (options.args.length !== 1)
+        die('rm requires exactly one device file path');
+    const remotePath = options.args[0];
+    if (!remotePath.startsWith('/'))
+        die('rm requires an absolute device path');
+    asciiBytes(remotePath);
+    if (options.dryRun) {
+        print(JSON.stringify({command: 'rm', opcode: '0x66', path: remotePath}, null, 2));
+        return;
+    }
+    withSerial(options, serial => {
+        deleteRemoteFile(serial, remotePath);
+        const parent = remoteParent(remotePath);
+        const name = remoteBasename(remotePath);
+        const files = listRemoteDir(serial, parent);
+        if (files.includes(name))
+            throw new Error(`delete verification failed: ${remotePath} is still listed`);
+        print(`Deleted ${remotePath}`);
+    });
+}
+
+function commandStorage(options) {
+    if (options.args.length !== 0)
+        die('storage takes no arguments');
+    print('Known firmware roots:');
+    print('  /root/img/');
+    print('  /root/video/');
+    print('  /mnt/SDCARD/img/');
+    print('  /mnt/SDCARD/video/');
+    if (options.dryRun) {
+        print('Would issue AlphaMonitor storage-info command 0x64 and parse six numeric counters.');
+        return;
+    }
+    withSerial(options, serial => {
+        const counters = queryStorageInfo(serial);
+        print(`Storage counters: ${counters.join(' - ')}`);
+        print('Note: AlphaMonitor consumes these six counters as storage statistics; exact labels vary by firmware branch, so raw counters are preserved here.');
+    });
+}
+
+function commandDeviceStart(options) {
+    const parsed = parseDeviceStartCommand(options.args);
+    if (parsed.file && !pathExists(parsed.file))
+        die(`startup content does not exist: ${parsed.file}`);
+
+    const config = loadConfig();
+    const deviceConfig = localDeviceConfig(config);
+    const previousStartupTarget = config.startupDisplay?.target || null;
+    const startMode = parsed.mode === 'image' ? 1 : parsed.mode === 'media' ? 2 : 0;
+    const target = parsed.mode === 'image'
+        ? `${DEFAULT_IMAGE_ROOT}${safeStartupDeviceImageFilename(parsed.file)}`
+        : parsed.mode === 'media'
+            ? `${DEFAULT_VIDEO_ROOT}${safeStartupDeviceFilename(parsed.file)}`
+            : null;
+
+    if (options.dryRun) {
+        print(JSON.stringify({
+            command: 'device-start',
+            mode: parsed.mode,
+            firmwareStartMode: startMode,
+            source: parsed.file,
+            target,
+            brightness: parsed.brightness,
+            rotation: parsed.rotation,
+            mirrorHorizontal: parsed.mirrorHorizontal,
+            mirrorVertical: parsed.mirrorVertical,
+            direct: parsed.direct,
+            preservedDeviceConfig: {
+                flip: deviceConfig.flip,
+                sleepDelay: deviceConfig.sleepDelay,
+            },
+            protocol: parsed.mode === 'image'
+                ? {upload: '0x6f', verifySize: '0x6e', selectImage: '0x8c', saveConfig: '0x7d'}
+                : parsed.mode === 'media'
+                    ? {upload: '0x6f', verifySize: '0x6e', playVideo: '0x78 flag=1', saveConfig: '0x7d'}
+                    : {saveConfig: '0x7d'},
+        }, null, 2));
+        return;
+    }
+
+    if (parsed.mode === 'default') {
+        withSerial(options, serial => {
+            saveDeviceConfigPacket(serial.output, parsed.brightness, 0, deviceConfig.flip, deviceConfig.sleepDelay);
+            serial.output.flush(null);
+            cleanupManagedStartupTarget(serial, previousStartupTarget);
+        });
+        rememberStartupDisplay('default', null, null, parsed);
+        print('Device startup display set to firmware default.');
+        return;
+    }
+
+    let prepared = parsed.file;
+    let temporary = null;
+    try {
+        if (parsed.mode === 'image') {
+            temporary = GLib.build_filenamev([GLib.get_tmp_dir(), `frozr-start-${GLib.get_monotonic_time()}.jpg`]);
+            prepareStoredImage(parsed.file, temporary, parsed);
+            prepared = temporary;
+            print(`Prepared startup image: ${fileSize(prepared)} bytes`);
+        } else if (!parsed.direct) {
+            temporary = GLib.build_filenamev([GLib.get_tmp_dir(), `frozr-start-${GLib.get_monotonic_time()}.mp4`]);
+            print(`Transcoding startup animation/video for ${WIDTH}x${HEIGHT} panel...`);
+            transcodeForPanel(parsed.file, temporary, options, parsed);
+            prepared = temporary;
+            print(`Prepared startup MP4: ${fileSize(prepared)} bytes`);
+        }
+
+        withSerial(options, serial => {
+            sendStop(serial.output);
+            setBrightness(serial.output, parsed.brightness);
+            uploadAndVerify(serial, prepared, target);
+            if (parsed.mode === 'image') {
+                print(`Selecting startup image ${target}...`);
+                playRemoteImage(serial, target);
+                print('Startup image selected.');
+            } else {
+                print(`Selecting startup animation/video ${target}...`);
+                playRemoteVideo(serial, target, true);
+                print('Startup animation/video selected.');
+            }
+            saveDeviceConfigPacket(serial.output, parsed.brightness, startMode, deviceConfig.flip, deviceConfig.sleepDelay);
+            serial.output.flush(null);
+            cleanupManagedStartupTarget(serial, previousStartupTarget, target);
+        });
+
+        rememberStartupDisplay(parsed.mode, parsed.file, target, parsed);
+        print(`Firmware startup mode saved: ${parsed.mode}.`);
+    } finally {
+        if (temporary && pathExists(temporary)) {
+            try {
+                Gio.File.new_for_path(temporary).delete(null);
+            } catch (_) {
+                // Best-effort cleanup.
+            }
+        }
+    }
+}
+
+function parseOnOff(value, option) {
+    if (value === 'on' || value === 'true' || value === '1')
+        return true;
+    if (value === 'off' || value === 'false' || value === '0')
+        return false;
+    die(`${option} must be on or off`);
+}
+
+function parseByte(value, option) {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 0 || n > 255)
+        die(`${option} must be an integer from 0 to 255`);
+    return n;
+}
+
+function commandDeviceConfig(options) {
+    const config = loadConfig();
+    const current = localDeviceConfig(config);
+    let brightness = Number.isInteger(config.brightness) ? config.brightness : 25;
+    let startMode = current.startMode;
+    let flip = current.flip;
+    let sleepDelay = current.sleepDelay;
+    for (let i = 0; i < options.args.length; i++) {
+        const arg = options.args[i];
+        if (arg === '--brightness') {
+            if (++i >= options.args.length)
+                die('--brightness requires a value');
+            brightness = Number(options.args[i]);
+            if (!Number.isInteger(brightness) || brightness < 0 || brightness > 100)
+                die('--brightness must be 0..100');
+        } else if (arg === '--start-mode') {
+            if (++i >= options.args.length)
+                die('--start-mode requires a value');
+            startMode = parseByte(options.args[i], '--start-mode');
+        } else if (arg === '--flip') {
+            if (++i >= options.args.length)
+                die('--flip requires on or off');
+            flip = parseOnOff(options.args[i], '--flip');
+        } else if (arg === '--sleep-delay') {
+            if (++i >= options.args.length)
+                die('--sleep-delay requires a value');
+            sleepDelay = parseByte(options.args[i], '--sleep-delay');
+        } else {
+            die(`unknown device-config option: ${arg}`);
+        }
+    }
+    if (options.dryRun) {
+        print(JSON.stringify({command: 'device-config', opcode: '0x7d', brightness, startMode, flip, sleepDelay}, null, 2));
+        return;
+    }
+    withSerial(options, serial => {
+        saveDeviceConfigPacket(serial.output, brightness, startMode, flip, sleepDelay);
+        serial.output.flush(null);
+        print(`Device config saved: brightness=${brightness}% startMode=${startMode} flip=${flip ? 'on' : 'off'} sleepDelay=${sleepDelay}`);
+    });
+    const updated = loadConfig();
+    updated.brightness = brightness;
+    rememberDeviceConfig(updated, {startMode, flip, sleepDelay});
+    saveConfig(updated);
+}
+
+function commandConfig(options) {
+    const config = loadConfig();
+    if (options.args.length === 0) {
+        print(JSON.stringify(config, null, 2));
+        return;
+    }
+    if (options.args.length === 4 && options.args[0] === 'transform') {
+        config.rotation = normalizeRotation(options.args[1], 'rotation');
+        config.mirrorHorizontal = parseOnOff(options.args[2], 'mirror-horizontal');
+        config.mirrorVertical = parseOnOff(options.args[3], 'mirror-vertical');
+        saveConfig(config);
+        print(`Transform saved: rotation=${config.rotation} mirrorHorizontal=${config.mirrorHorizontal ? 'on' : 'off'} mirrorVertical=${config.mirrorVertical ? 'on' : 'off'}`);
+        return;
+    }
+    die('config supports: config | config transform ROTATION MIRROR_HORIZONTAL MIRROR_VERTICAL');
+}
+
+function commandDoctor(options) {
+    if (options.args.length !== 0)
+        die('doctor takes no arguments');
+    const ffmpeg = findFfmpeg();
+    const device = resolveDevice(Object.assign({}, options, {wake: false}));
+    let gjsVersion = 'available';
+    try {
+        const gjs = GLib.find_program_in_path('gjs') || '/usr/bin/gjs';
+        gjsVersion = runCapture([gjs, '--version']).trim();
+    } catch (_) {
+        // Keep a useful doctor result even if version probing fails.
+    }
+    print(`GJS: ${gjsVersion}`);
+    print(`FFmpeg: ${ffmpeg || 'missing'}`);
+    print(`Config: ${configFilePath()}`);
+    print(`Awake device: ${device || 'not detected'}`);
+    if (device) {
+        const readable = GLib.access(device, 4) === 0;
+        const writable = GLib.access(device, 2) === 0;
+        print(`Serial access: read=${readable ? 'yes' : 'no'} write=${writable ? 'yes' : 'no'}`);
+    }
+    print(`Sleeping identity: ${SLEEP_VIDPID}/${SLEEP_SERIAL}`);
+    print(`Awake identity: ${AWAKE_VIDPID}/${AWAKE_SERIAL}`);
+}
+
+function commandPlay(options) {
+    let remotePath = null;
+    let background = false;
+    for (const arg of options.args) {
+        if (arg === '--background')
+            background = true;
+        else if (arg.startsWith('-'))
+            die(`unknown play option: ${arg}`);
+        else if (remotePath === null)
+            remotePath = arg;
+        else
+            die(`unexpected play argument: ${arg}`);
+    }
+    if (!remotePath)
+        die('play requires a device file path');
+    if (!remotePath.startsWith('/'))
+        die('play requires an absolute device path');
+    asciiBytes(remotePath);
+    if (options.dryRun) {
+        print(JSON.stringify({command: 'play', opcode: '0x78', path: remotePath, backgroundFlag: background ? 1 : 0}, null, 2));
+        return;
+    }
+    withSerial(options, serial => {
+        sendStop(serial.output);
+        playRemoteVideo(serial, remotePath, background);
+        print(`Playing ${remotePath}${background ? ' (background)' : ''}.`);
+    });
+    rememberAction({type: 'remote-media', target: remotePath, background});
+}
+
+function commandRestore(options) {
+    if (options.args.length !== 0)
+        die('restore takes no arguments');
+    const config = loadConfig();
+    const action = config.lastAction;
+    if (!action) {
+        print('No saved LCD action to restore.');
+        return;
+    }
+    if (options.dryRun) {
+        print(JSON.stringify({command: 'restore', action}, null, 2));
+        return;
+    }
+    if (action.type === 'image') {
+        if (!pathExists(action.source))
+            throw new Error(`saved image no longer exists: ${action.source}`);
+        withSerial(options, serial => {
+            sendStaticImage(serial, action.source, Number.isInteger(action.brightness) ? action.brightness : config.brightness, {
+                rotation: action.rotation ?? config.rotation ?? 0,
+                mirrorHorizontal: action.mirrorHorizontal ?? config.mirrorHorizontal ?? false,
+                mirrorVertical: action.mirrorVertical ?? config.mirrorVertical ?? false,
+            });
+        });
+        print(`Restored image ${action.source}`);
+        return;
+    }
+    if (action.type === 'remote-media') {
+        withSerial(options, serial => {
+            sendStop(serial.output);
+            setBrightness(serial.output, Number.isInteger(action.brightness) ? action.brightness : config.brightness);
+            playRemoteVideo(serial, action.target, Boolean(action.background));
+        });
+        print(`Restored media ${action.target}`);
+        return;
+    }
+    if (action.type === 'dashboard') {
+        runDashboard(options, {
+            brightness: Number.isInteger(action.brightness) ? action.brightness : config.brightness,
+            interval: Number.isInteger(action.interval) ? action.interval : 1000,
+            frames: 0,
+            quiet: true,
+            rotation: action.rotation ?? config.rotation ?? 0,
+            mirrorHorizontal: action.mirrorHorizontal ?? config.mirrorHorizontal ?? false,
+            mirrorVertical: action.mirrorVertical ?? config.mirrorVertical ?? false,
+        }, false);
+        return;
+    }
+    if (action.type === 'stopped') {
+        withSerial(options, serial => sendStop(serial.output));
+        print('Restored stopped playback state.');
+        return;
+    }
+    throw new Error(`unsupported saved action type: ${action.type}`);
+}
+
+function commandContentInfo(options) {
+    if (options.args.length !== 1)
+        die('content-info requires exactly one local file');
+    const file = canonicalPath(options.args[0]);
+    if (!pathExists(file))
+        die(`content does not exist: ${file}`);
+    print(JSON.stringify({file, ...probeVisualContent(file)}, null, 2));
+}
+
+function commandPreview(options) {
+    const parsed = parsePreviewCommand(options.args);
+    if (!pathExists(parsed.file))
+        die(`preview input does not exist: ${parsed.file}`);
+
+    const info = probeVisualContent(parsed.file);
+    if (!info.animated) {
+        const pixbuf = applyUserTransformPixbuf(loadSquareImage(parsed.file), parsed);
+        pixbuf.savev(parsed.output, 'png', [], []);
+    } else if (parsed.output.toLowerCase().endsWith('.mp4')) {
+        transcodeForPanel(parsed.file, parsed.output, options, parsed);
+    } else {
+        const ffmpeg = findFfmpeg();
+        if (!ffmpeg)
+            throw new Error('ffmpeg is required to preview animated content. Ubuntu/Debian: sudo apt install ffmpeg.');
+        const argv = [
+            ffmpeg, '-hide_banner', '-loglevel', options.verbose ? 'info' : 'error', '-y',
+            '-i', parsed.file,
+            '-vf', panelFilterForTransform(parsed),
+            '-frames:v', '1', '-an', parsed.output,
+        ];
+        logVerbose(options, argv.join(' '));
+        const proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+        const [, , stderr] = proc.communicate_utf8(null, null);
+        if (!proc.get_successful())
+            throw new Error(`preview render failed: ${(stderr || '').trim()}`);
+    }
+    if (!pathExists(parsed.output))
+        throw new Error(`preview renderer did not create ${parsed.output}`);
+    print(parsed.output);
+}
+
+function commandMedia(options) {
+    const parsed = parseMediaCommand(options.args);
+    if (!pathExists(parsed.file))
+        die(`media file does not exist: ${parsed.file}`);
+
+    const ext = GLib.path_get_basename(parsed.file).toLowerCase();
+    if (parsed.direct && !ext.endsWith('.mp4'))
+        die('--direct currently accepts MP4 only');
+    if (parsed.direct && (parsed.rotation !== 0 || parsed.mirrorHorizontal || parsed.mirrorVertical))
+        die('--direct uploads bytes as-is and cannot apply rotation/mirroring; remove --direct to transform the media');
+
+    if (options.dryRun) {
+        print(JSON.stringify({
+            command: 'media',
+            input: parsed.file,
+            target: parsed.target,
+            transcode: !parsed.direct,
+            ffmpeg: parsed.direct ? null : findFfmpeg(),
+            backgroundFlag: parsed.background ? 1 : 0,
+            playAfterUpload: parsed.play,
+            brightness: parsed.brightness,
+            rotation: parsed.rotation,
+            mirrorHorizontal: parsed.mirrorHorizontal,
+            mirrorVertical: parsed.mirrorVertical,
+            protocol: {
+                create: '0x6f',
+                verifySize: '0x6e',
+                play: '0x78',
+                stopVideo: '0x79',
+            },
+        }, null, 2));
+        return;
+    }
+
+    let prepared = parsed.file;
+    let temporary = null;
+    try {
+        if (!parsed.direct) {
+            temporary = GLib.build_filenamev([GLib.get_tmp_dir(), `frozrctl-${GLib.get_monotonic_time()}.mp4`]);
+            print(`Transcoding for ${WIDTH}x${HEIGHT} panel...`);
+            transcodeForPanel(parsed.file, temporary, options, parsed);
+            prepared = temporary;
+            print(`Prepared MP4: ${fileSize(prepared)} bytes`);
+        }
+
+        withSerial(options, serial => {
+            sendStop(serial.output);
+            setBrightness(serial.output, parsed.brightness);
+            uploadAndPlay(serial, prepared, parsed.target, parsed.background, parsed.play);
+        });
+        saveTransform(parsed);
+        if (parsed.play) {
+            rememberAction({
+                type: 'remote-media',
+                source: parsed.file,
+                target: parsed.target,
+                background: parsed.background,
+                brightness: parsed.brightness,
+                rotation: parsed.rotation,
+                mirrorHorizontal: parsed.mirrorHorizontal,
+                mirrorVertical: parsed.mirrorVertical,
+            });
+        }
+    } finally {
+        if (temporary && pathExists(temporary)) {
+            try {
+                Gio.File.new_for_path(temporary).delete(null);
+            } catch (_) {
+                // Best-effort cleanup.
+            }
+        }
+    }
+}
+
+function main() {
+    const options = parseArgs(ARGV);
+    try {
+        switch (options.command) {
+        case 'status':
+            commandStatus(options);
+            break;
+        case 'doctor':
+            commandDoctor(options);
+            break;
+        case 'brightness':
+            commandBrightness(options);
+            break;
+        case 'image':
+            commandImage(options);
+            break;
+        case 'content-info':
+            commandContentInfo(options);
+            break;
+        case 'preview':
+            commandPreview(options);
+            break;
+        case 'media':
+            commandMedia(options);
+            break;
+        case 'play':
+            commandPlay(options);
+            break;
+        case 'dashboard':
+            commandDashboard(options);
+            break;
+        case 'stop':
+            commandStop(options);
+            break;
+        case 'ls':
+            commandList(options);
+            break;
+        case 'rm':
+            commandRemove(options);
+            break;
+        case 'storage':
+            commandStorage(options);
+            break;
+        case 'file-size':
+            commandFileSize(options);
+            break;
+        case 'device-config':
+            commandDeviceConfig(options);
+            break;
+        case 'device-start':
+            commandDeviceStart(options);
+            break;
+        case 'config':
+            commandConfig(options);
+            break;
+        case 'restore':
+            commandRestore(options);
+            break;
+        case 'help':
+            usage();
+            break;
+        default:
+            die(`unknown command: ${options.command}`);
+        }
+    } catch (error) {
+        die(error.message || String(error));
+    }
+}
+
+main();
