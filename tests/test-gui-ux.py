@@ -35,12 +35,12 @@ assert "makeSection('Display')" not in display
 assert 'new Gtk.Frame()' not in display
 assert "add_css_class('card')" not in display
 assert "label: 'Before Linux starts'" in display
-assert "label: 'After login'" in display
+assert "label: 'After Linux starts'" in display
 assert 'startupHeader.append(this.startupStatus)' in display
 assert 'sessionHeader.append(this.afterLoginStatus)' in display
 assert 'startupBody.append(startupHint)' in display
 assert 'sessionBody.append(sessionHint)' in display
-assert display.index("label: 'Before Linux starts'") < display.index("label: 'After login'")
+assert display.index("label: 'Before Linux starts'") < display.index("label: 'After Linux starts'")
 assert 'sessionBody.append(editor)' in display
 assert "label: 'Brightness'" in display
 assert 'Shared by both phases' not in display

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-0.1.2}"
 ARCH="all"
 PKG="frozro2-linux"
 BUILD="$ROOT/.build/${PKG}_${VERSION}_${ARCH}"
@@ -18,7 +18,7 @@ mkdir -p \
   "$BUILD/DEBIAN" \
   "$BUILD/usr/bin" \
   "$BUILD/usr/share/applications" \
-  "$BUILD/usr/lib/systemd/user/default.target.wants" \
+  "$BUILD/usr/lib/systemd/system" \
   "$BUILD/usr/lib/udev/rules.d" \
   "$BUILD/usr/share/doc/$PKG" \
   "$DIST"
@@ -34,9 +34,9 @@ sed 's|@GUI@|/usr/bin/frozr-gui|g' \
   > "$BUILD/usr/share/applications/io.github.xeift.FrozrO2Linux.desktop"
 
 sed 's|@CLI@|/usr/bin/frozrctl|g' \
-  "$ROOT/share/systemd/user/frozr-restore.service.in" \
-  > "$BUILD/usr/lib/systemd/user/frozr-restore.service"
-ln -s ../frozr-restore.service "$BUILD/usr/lib/systemd/user/default.target.wants/frozr-restore.service"
+  "$ROOT/share/systemd/system/frozr-restore@.service.in" \
+  > "$BUILD/usr/lib/systemd/system/frozr-restore@.service"
+chmod 644 "$BUILD/usr/lib/systemd/system/frozr-restore@.service"
 
 cat > "$BUILD/DEBIAN/control" <<EOF
 Package: $PKG
@@ -49,7 +49,7 @@ Maintainer: Xeift
 Description: Linux controller for the XIGMATEK Frozr-O II LCD
  Clean-room Linux CLI and GTK4 frontend for image display, media upload,
  on-device playback, live system dashboard, storage management, brightness,
- serial permissions and login state restore.
+ serial permissions and boot state restore.
 EOF
 
 cat > "$BUILD/DEBIAN/postinst" <<'EOF'
@@ -59,15 +59,41 @@ if command -v udevadm >/dev/null 2>&1; then
   udevadm control --reload-rules || true
   udevadm trigger --subsystem-match=tty || true
 fi
+
+TARGET_USER="${SUDO_USER:-}"
+if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != root ] && command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload
+  systemctl enable --now "frozr-restore@${TARGET_USER}.service" >/dev/null
+fi
 exit 0
 EOF
 chmod 755 "$BUILD/DEBIAN/postinst"
+
+cat > "$BUILD/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+set -e
+case "$1" in
+  remove|deconfigure)
+    if command -v systemctl >/dev/null 2>&1; then
+      for link in /etc/systemd/system/multi-user.target.wants/frozr-restore@*.service; do
+        [ -L "$link" ] || continue
+        systemctl disable --now "$(basename "$link")" >/dev/null 2>&1 || true
+      done
+    fi
+    ;;
+esac
+exit 0
+EOF
+chmod 755 "$BUILD/DEBIAN/prerm"
 
 cat > "$BUILD/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
 if command -v udevadm >/dev/null 2>&1; then
   udevadm control --reload-rules || true
+fi
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload || true
 fi
 exit 0
 EOF

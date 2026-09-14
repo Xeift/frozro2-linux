@@ -106,7 +106,7 @@ def main():
         pkt = read_exact(master, 250)
         assert_packet(pkt, 0x78, len(target_bytes), 1)
         assert pkt[10:10 + len(target_bytes)] == target_bytes
-        os.write(master, b'play_video_success')
+        os.write(master, b'ReadyVideo\r\nplay_video_success\r\n')
 
         stdout, stderr = proc.communicate(timeout=8)
         if proc.returncode != 0:

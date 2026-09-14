@@ -1,0 +1,15 @@
+[Unit]
+Description=Restore Frozr LCD content at boot for %i
+After=local-fs.target systemd-udev-trigger.service
+Wants=systemd-udev-trigger.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=SUDO_USER=%i
+ExecStart=@CLI@ restore
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

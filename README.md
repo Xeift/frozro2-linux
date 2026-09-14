@@ -19,9 +19,8 @@ If the LCD is unavailable after the first install, reconnect its internal USB co
 
 ## Configuration
 
-- **Before Linux starts** — set the firmware startup image, animation, or video.
-- **After login** — show normal content or run the system dashboard. The last state is restored automatically on login.
-- **Brightness** — shared by both phases.
+- **After Linux starts** — show normal content or run the system dashboard. The last state is restored automatically during boot, before login.
+- **Brightness** — control the LCD brightness.
 - **Library** — view, play, and delete uploaded media.
 
 
@@ -29,10 +28,9 @@ If the LCD is unavailable after the first install, reconnect its internal USB co
 
 - static images, GIF, APNG, animated WebP, and video
 - rotation and horizontal/vertical mirroring
-- firmware-native startup content
 - CPU, GPU, RAM, temperature, time/date dashboard
 - on-device media management
-- automatic login restore
+- automatic restore after cold boot / ErP shutdown
 - GTK4 / Libadwaita GUI
 - `frozrctl` CLI
 

@@ -30,7 +30,7 @@ done
 
 # A common mistake is `sudo ./install.sh --udev`. Support it safely: use the
 # root process only for the udev rule, then drop back to the original desktop
-# user for ~/.local files and systemd --user registration.
+# user for ~/.local files and system-service registration.
 if [[ "$EUID" -eq 0 ]]; then
   if [[ -z "${SUDO_USER:-}" || "${SUDO_USER}" == "root" ]]; then
     echo "Do not install Frozr-O II Linux as root directly; run it from your desktop user." >&2
@@ -69,9 +69,9 @@ PREFIX="${HOME}/.local"
 LIBDIR="${PREFIX}/lib/frozro2-linux"
 BINDIR="${PREFIX}/bin"
 APPDIR="${HOME}/.local/share/applications"
-USERUNITDIR="${HOME}/.config/systemd/user"
+SYSTEMUNIT="/etc/systemd/system/frozr-restore@.service"
 
-for cmd in gjs ffmpeg ffprobe systemctl sed; do
+for cmd in gjs ffmpeg ffprobe systemctl sed sudo; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "Missing required command: $cmd" >&2
     if [[ "$cmd" == "ffmpeg" || "$cmd" == "ffprobe" ]]; then
@@ -87,8 +87,7 @@ if ! gjs -c "imports.gi.versions.Gtk='4.0'; imports.gi.Gtk; imports.gi.versions.
   exit 1
 fi
 
-
-mkdir -p "$LIBDIR" "$BINDIR" "$APPDIR" "$USERUNITDIR"
+mkdir -p "$LIBDIR" "$BINDIR" "$APPDIR"
 install -m755 "$ROOT/bin/frozrctl" "$LIBDIR/frozrctl"
 install -m755 "$ROOT/bin/frozr-gui" "$LIBDIR/frozr-gui"
 ln -sfn "$LIBDIR/frozrctl" "$BINDIR/frozrctl"
@@ -100,21 +99,11 @@ sed "s|@GUI@|${BINDIR}/frozr-gui|g" \
 chmod 644 "$APPDIR/io.github.xeift.FrozrO2Linux.desktop"
 
 sed "s|@CLI@|${BINDIR}/frozrctl|g" \
-  "$ROOT/share/systemd/user/frozr-restore.service.in" \
-  > "$USERUNITDIR/frozr-restore.service"
-chmod 644 "$USERUNITDIR/frozr-restore.service"
-
-if systemctl --user daemon-reload; then
-  systemctl --user enable frozr-restore.service >/dev/null
-else
-  cat >&2 <<'EOF'
-warning: could not contact the user systemd session.
-The CLI/GUI were installed, but the automatic login-restore service could not be enabled.
-From a normal desktop terminal, run:
-  systemctl --user daemon-reload
-  systemctl --user enable frozr-restore.service
-EOF
-fi
+  "$ROOT/share/systemd/system/frozr-restore@.service.in" \
+  | sudo tee "$SYSTEMUNIT" >/dev/null
+sudo chmod 644 "$SYSTEMUNIT"
+sudo systemctl daemon-reload
+sudo systemctl enable --now "frozr-restore@${USER}.service" >/dev/null
 
 if [[ "$INSTALL_UDEV" -eq 1 && "$UDEV_ALREADY_INSTALLED" -ne 1 ]]; then
   sudo install -m644 "$ROOT/packaging/60-frozr-lcd.rules" /etc/udev/rules.d/60-frozr-lcd.rules
@@ -127,7 +116,7 @@ Installed Frozr-O II Linux.
 
 CLI: $BINDIR/frozrctl
 GUI: $BINDIR/frozr-gui
-Auto-restore service: frozr-restore.service
+Boot-restore service: frozr-restore@${USER}.service
 EOF
 
 if [[ "$INSTALL_UDEV" -eq 0 ]]; then

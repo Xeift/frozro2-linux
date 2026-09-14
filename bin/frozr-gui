@@ -375,7 +375,7 @@ class FrozrWindow {
         phases.append(sessionBody);
 
         const sessionHeader = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 10});
-        const sessionTitle = new Gtk.Label({label: 'After login', xalign: 0, hexpand: true});
+        const sessionTitle = new Gtk.Label({label: 'After Linux starts', xalign: 0, hexpand: true});
         sessionTitle.add_css_class('heading');
         sessionHeader.append(sessionTitle);
         this.afterLoginStatus = new Gtk.Label({label: 'Nothing saved', xalign: 1});
@@ -384,7 +384,7 @@ class FrozrWindow {
         sessionBody.append(sessionHeader);
 
         const sessionHint = new Gtk.Label({
-            label: 'Your normal Linux-controlled display. The last content shown here is restored automatically on the next login.',
+            label: 'Your normal Linux-controlled display. The last content shown here is restored automatically on the next boot.',
             xalign: 0,
             wrap: true,
         });
